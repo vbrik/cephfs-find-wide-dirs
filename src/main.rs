@@ -1,6 +1,6 @@
 use clap::Parser;
-use crossbeam_channel::{Receiver, Sender, bounded};
-use log::error;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use log::{error, info, warn};
 use std::fs;
 use std::io;
 use std::io::ErrorKind;
@@ -27,21 +27,8 @@ struct Args {
     min_files: i64,
 
     /// Number of threads
-    #[arg(long = "threads", value_name = "NUMBER", default_value_t = 16)]
+    #[arg(short, long = "threads", value_name = "NUMBER", default_value_t = 16)]
     num_threads: usize,
-}
-
-/// How a directory should be handled after examining its xattrs.
-#[derive(Debug, Clone)]
-pub enum Decision {
-    /// Directory matches. Do NOT traverse its subdirectories.
-    MatchPrune(i64),
-    /// Directory matches. DO traverse its subdirectories.
-    MatchContinue(i64),
-    /// Directory does NOT match. Do NOT traverse its subdirectories.
-    Prune,
-    /// Directory does NOT match. DO traverse its subdirectories.
-    Continue,
 }
 
 #[derive(Debug)]
@@ -53,54 +40,31 @@ enum Work {
 /// Parse and return the value of an integer extended attribute
 fn get_xattr_i64(path: &Path, attr: &str) -> io::Result<i64> {
     let bytes = xattr::get(path, attr)?.ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::Other,
-            format!("xattr error path={}, attr={}", path.display(), attr),
-        )
+        io::Error::new( ErrorKind::Other, format!("xattr error path={:?}, attr={}", path, attr))
     })?;
-
     let s = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
     let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-
     s.parse::<i64>()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
 }
 
-/// Determine if the directory has enough files to be considered "wide",
-/// and its subdirectories need to be examined.
-fn classify_dir(dir: &Path, min_file_count: i64) -> io::Result<Decision> {
+fn get_file_counts(dir: &Path) -> io::Result<(i64, i64)> {
     let num_files = get_xattr_i64(dir, "ceph.dir.files")?;
     let num_rfiles = get_xattr_i64(dir, "ceph.dir.rfiles")?;
-    // number of files in all subdirectories
-    let num_sub_rfiles = num_rfiles - num_files;
-
-    if num_files >= min_file_count {
-        // dir is a match by file count; do we need to descend?
-        if num_sub_rfiles >= min_file_count {
-            Ok(Decision::MatchContinue(num_files))
-        } else {
-            Ok(Decision::MatchPrune(num_files))
-        }
-    } else {
-        // dir doesn't have enough files; do we need to descend?
-        if num_sub_rfiles >= min_file_count {
-            Ok(Decision::Continue)
-        } else {
-            Ok(Decision::Prune)
-        }
-    }
+    Ok((num_files, num_rfiles))
 }
+
 
 /// Thread worker
 fn crawler_worker(
     dir_rx: Receiver<Work>,            // incoming work queue
     dir_tx: Sender<Work>,              // outgoing work queue
-    match_tx: Sender<PathBuf>,         // outgoing match queue
+    match_tx: Sender<(PathBuf, i64)>,         // outgoing match queue
     pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
     min_file_count: i64,
 ) {
     loop {
+        //print!(".");
         let Ok(work) = dir_rx.recv() else {
             error!("dir_rx error");
             break; // disconnected
@@ -108,13 +72,14 @@ fn crawler_worker(
         let dir = match work {
             Work::Dir(dir) => dir,
             Work::Shutdown => {
+                //error!("shutting down");
                 // Keep the shutdown signal in the queue for the remaining workers.
                 let _ = dir_tx.send(Work::Shutdown);
                 break;
             }
         };
 
-        let decision = match classify_dir(&dir, min_file_count) {
+        let (num_files, num_rfiles) = match get_file_counts(&dir) {
             Ok(v) => v,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 continue;
@@ -126,17 +91,15 @@ fn crawler_worker(
             }
         };
 
-        if matches!(
-            decision,
-            Decision::MatchPrune(_) | Decision::MatchContinue(_)
-        ) {
-            if match_tx.send(dir.clone()).is_err() {
+        if num_files >= min_file_count {
+            if match_tx.send((dir.clone(), num_files)).is_err() {
                 error!("match_tx error");
+                let _ = dir_tx.send(Work::Shutdown);
                 break;
             }
         }
 
-        if matches!(decision, Decision::MatchContinue(_) | Decision::Continue) {
+        if num_rfiles - num_files >= min_file_count {
             for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let Ok(ft) = direntry.file_type() else {
                     continue;
@@ -151,6 +114,7 @@ fn crawler_worker(
                 pending_dir_count.fetch_add(1, Ordering::Relaxed);
                 if dir_tx.send(Work::Dir(direntry.path())).is_err() {
                     error!("dir_tx error");
+                    let _ = dir_tx.send(Work::Shutdown);
                     break; // disconnected
                 }
             }
@@ -159,10 +123,12 @@ fn crawler_worker(
         // Finish this directory.
         let prev = pending_dir_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
+            //error!("stopping {}", prev);
             // Finishing this directory made pending go 1 -> 0. This means no more work.
             let _ = dir_tx.send(Work::Shutdown);
             break;
         }
+        //error!("{}", prev);
     }
 }
 
@@ -177,10 +143,9 @@ fn main() {
     }
 
     let n_workers = args.num_threads;
-    let queue_capacity: usize = 100_000;
 
-    let (dir_tx, dir_rx) = bounded::<Work>(queue_capacity);
-    let (match_tx, match_rx) = bounded::<PathBuf>(queue_capacity);
+    let (dir_tx, dir_rx) = unbounded::<Work>();
+    let (match_tx, match_rx) = unbounded::<(PathBuf, i64)>();
 
     let dirs_pending = Arc::new(AtomicU64::new(0));
 
@@ -203,8 +168,8 @@ fn main() {
     // Close match sender clone so match_rx ends when workers exit
     drop(match_tx);
     // Drain matches until workers are done (all match_tx clones dropped)
-    while let Ok(p) = match_rx.recv() {
-        println!("{}/", p.display());
+    while let Ok((path, num_files)) = match_rx.recv() {
+        println!("{}/ {}", path.display(), num_files);
     }
 
     for h in workers {
