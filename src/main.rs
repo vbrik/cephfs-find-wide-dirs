@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use log::error;
@@ -24,7 +23,7 @@ struct Args {
     search_root: String,
 
     /// Minimum number of files
-    #[arg(value_name = "NUMBER")]
+    #[arg(short, long = "min-num-files", value_name = "NUMBER")]
     min_files: i64,
 
     /// Number of threads
@@ -48,44 +47,43 @@ pub enum Decision {
 #[derive(Debug)]
 enum Work {
     Dir(PathBuf), // process this dir
-    Stop,         // shut down
+    Shutdown,     // shut down
 }
 
-fn get_xattr_numeric(path: &Path, attr: &str) -> io::Result<i64> {
-    let bytes = xattr::get(path, attr)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "xattr not present"))?;
+/// Parse and return the value of an integer extended attribute
+fn get_xattr_i64(path: &Path, attr: &str) -> io::Result<i64> {
+    let bytes = xattr::get(path, attr)?.ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::Other,
+            format!("xattr error path={}, attr={}", path.display(), attr),
+        )
+    })?;
 
-    let s =
-        std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let s = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
 
     let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
 
-    if s.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "xattr value is empty after trimming",
-        ));
-    }
-
     s.parse::<i64>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
 }
 
+/// Determine if the directory has enough files to be considered "wide",
+/// and its subdirectories need to be examined.
 fn classify_dir(dir: &Path, min_file_count: i64) -> io::Result<Decision> {
-    let num_files = get_xattr_numeric(dir, "ceph.dir.files")?;
-    let num_rfiles = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
+    let num_files = get_xattr_i64(dir, "ceph.dir.files")?;
+    let num_rfiles = get_xattr_i64(dir, "ceph.dir.rfiles")?;
     // number of files in all subdirectories
     let num_sub_rfiles = num_rfiles - num_files;
 
     if num_files >= min_file_count {
-        // match
+        // dir is a match by file count; do we need to descend?
         if num_sub_rfiles >= min_file_count {
             Ok(Decision::MatchContinue(num_files))
         } else {
             Ok(Decision::MatchPrune(num_files))
         }
     } else {
-        // no match
+        // dir doesn't have enough files; do we need to descend?
         if num_sub_rfiles >= min_file_count {
             Ok(Decision::Continue)
         } else {
@@ -94,11 +92,12 @@ fn classify_dir(dir: &Path, min_file_count: i64) -> io::Result<Decision> {
     }
 }
 
+/// Thread worker
 fn crawler_worker(
-    dir_rx: Receiver<Work>,
-    dir_tx: Sender<Work>,
-    match_tx: Sender<PathBuf>,
-    pending_dir_count: Arc<AtomicU64>,
+    dir_rx: Receiver<Work>,            // incoming work queue
+    dir_tx: Sender<Work>,              // outgoing work queue
+    match_tx: Sender<PathBuf>,         // outgoing match queue
+    pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
     min_file_count: i64,
 ) {
     loop {
@@ -108,9 +107,9 @@ fn crawler_worker(
         };
         let dir = match work {
             Work::Dir(dir) => dir,
-            Work::Stop => {
+            Work::Shutdown => {
                 // Keep the shutdown signal in the queue for the remaining workers.
-                let _ = dir_tx.send(Work::Stop);
+                let _ = dir_tx.send(Work::Shutdown);
                 break;
             }
         };
@@ -122,7 +121,7 @@ fn crawler_worker(
             }
             Err(_) => {
                 error!("Failed to process {:?} with error {}", dir, min_file_count);
-                let _ = dir_tx.send(Work::Stop);
+                let _ = dir_tx.send(Work::Shutdown);
                 break;
             }
         };
@@ -161,7 +160,7 @@ fn crawler_worker(
         let prev = pending_dir_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             // Finishing this directory made pending go 1 -> 0. This means no more work.
-            let _ = dir_tx.send(Work::Stop);
+            let _ = dir_tx.send(Work::Shutdown);
             break;
         }
     }
