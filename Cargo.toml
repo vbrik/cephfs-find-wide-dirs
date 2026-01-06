@@ -1,5 +1,5 @@
 [package]
-name = "cephfs-wide-dirs"
+name = "cephfs-find-wide-dirs"
 version = "0.1.0"
 edition = "2024"
 
