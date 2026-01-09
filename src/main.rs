@@ -1,6 +1,6 @@
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use log::{error, info, warn};
+use log::error;
 use std::fs;
 use std::io;
 use std::io::ErrorKind;
@@ -14,22 +14,23 @@ use std::thread;
 use xattr;
 
 #[derive(Debug)]
-enum Work {
+enum WorkItem {
     Dir(PathBuf), // process this dir
     Shutdown,     // shut down
 }
 
 #[derive(Debug, Clone, Copy)]
-enum LoopCtl {
+enum MainLoopCtl {
     Continue,
     Break,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum XattrError {
     Io(io::Error),
     Utf8(std::str::Utf8Error),
-    Parse,
+    Parse(String),
     NotFound,
 }
 impl From<io::Error> for XattrError {
@@ -47,6 +48,7 @@ pub struct PendingGuard<'a> {
     pending: &'a AtomicU64,
     active: bool,
 }
+
 impl<'a> PendingGuard<'a> {
     pub fn new(pending: &'a AtomicU64) -> Self {
         Self {
@@ -59,6 +61,7 @@ impl<'a> PendingGuard<'a> {
         self.pending.fetch_sub(1, Ordering::AcqRel)
     }
 }
+
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         if self.active {
@@ -70,53 +73,23 @@ impl Drop for PendingGuard<'_> {
 fn get_xattr_numeric<T>(path: &Path, attr: &str) -> Result<T, XattrError>
 where
     T: FromStr,
+    T::Err: std::fmt::Display,
 {
     let bytes = xattr::get(path, attr)?.ok_or(XattrError::NotFound)?;
     let s = std::str::from_utf8(&bytes)?;
     let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    s.parse::<T>().map_err(|_| XattrError::Parse)
+    s.parse::<T>().map_err(|e| XattrError::Parse(e.to_string()))
 }
 
-fn get_xattr(path: &Path, attr: &str) -> io::Result<i64> {
-    let bytes = xattr::get(path, attr)?.ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::Other,
-            format!("xattr error path={:?}, attr={}", path, attr),
-        )
-    })?;
-    let s = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    s.parse::<i64>()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
-}
-
-fn get_xattr2<T>(path: &Path, attr: &str) -> io::Result<T>
-where
-    T: FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-{
-    let bytes = xattr::get(path, attr)?.ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::Other,
-            format!("xattr error path={:?}, attr={}", path, attr),
-        )
-    })?;
-    let s = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    s.parse::<T>()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
-}
-
-fn get_file_counts(dir: &Path) -> io::Result<(i64, i64)> {
-    let num_files: i64 = get_xattr2(dir, "ceph.dir.files")?;
-    let num_rfiles: i64 = get_xattr2(dir, "ceph.dir.rfiles")?;
+fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
+    let num_files: i64 = get_xattr_numeric(dir, "ceph.dir.files")?;
+    let num_rfiles: i64 = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
     Ok((num_files, num_rfiles))
 }
 
-/// Thread worker
-fn crawler_worker(
-    dir_rx: Receiver<Work>,            // incoming work queue
-    dir_tx: Sender<Work>,              // outgoing work queue
+fn crawler_worker_loop(
+    dir_rx: Receiver<WorkItem>,            // incoming work queue
+    dir_tx: Sender<WorkItem>,              // outgoing work queue
     match_tx: Sender<(PathBuf, i64)>,  // outgoing match queue
     pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
     min_file_count: i64,
@@ -124,123 +97,48 @@ fn crawler_worker(
     loop {
         let Ok(work) = dir_rx.recv() else {
             error!("dir_rx error");
-            break; // disconnected
+            break;
         };
         let dir = match work {
-            Work::Dir(dir) => dir,
-            Work::Shutdown => {
-                // Keep the shutdown signal in the queue for the remaining workers.
-                let _ = dir_tx.send(Work::Shutdown);
+            WorkItem::Dir(dir) => dir,
+            WorkItem::Shutdown => {
                 break;
             }
         };
-
-        let (num_files, num_rfiles) = match get_file_counts(&dir) {
-            Ok(v) => v,
-            // If the directory disappeared, pretend it's empty, don't just continue.
-            // this way pending_dir_count will get decremented properly at the end
-            Err(e) if e.kind() == ErrorKind::NotFound => (0, 0),
-            Err(_) => {
-                error!("Failed to process {:?} with error {}", dir, min_file_count);
-                let _ = dir_tx.send(Work::Shutdown);
-                break;
-            }
-        };
-
-        if num_files >= min_file_count {
-            if match_tx.send((dir.clone(), num_files)).is_err() {
-                error!("match_tx error");
-                let _ = dir_tx.send(Work::Shutdown);
-                break;
-            }
-        }
-
-        if num_rfiles - num_files >= min_file_count {
-            for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let Ok(ft) = direntry.file_type() else {
-                    continue;
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
-
-                // Semantically, pending_dir_count counts queued + in-flight directories.
-                // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
-                // so increment before enqueue.
-                pending_dir_count.fetch_add(1, Ordering::Relaxed);
-                if dir_tx.send(Work::Dir(direntry.path())).is_err() {
-                    error!("dir_tx error");
-                    let _ = dir_tx.send(Work::Shutdown);
-                    break; // disconnected
-                }
-            }
-        }
-
-        // Finish this directory.
-        let prev = pending_dir_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            //error!("stopping {}", prev);
-            // Finishing this directory made pending go 1 -> 0. This means no more work.
-            let _ = dir_tx.send(Work::Shutdown);
-            break;
-        }
-        //error!("{}", prev);
-    }
-}
-
-fn crawler_worker_loop(
-    dir_rx: Receiver<Work>,            // incoming work queue
-    dir_tx: Sender<Work>,              // outgoing work queue
-    match_tx: Sender<(PathBuf, i64)>,  // outgoing match queue
-    pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
-    min_file_count: i64,
-) {
-    loop {
-        match crawler_worker3(&dir_rx, &dir_tx, &match_tx, &pending_dir_count, min_file_count) {
-            LoopCtl::Continue => continue,
-            LoopCtl::Break => break,
+        match process_dir(&dir, &dir_tx, &match_tx, &pending_dir_count, min_file_count) {
+            MainLoopCtl::Continue => continue,
+            MainLoopCtl::Break => break,
         }
     }
+    let _ = dir_tx.send(WorkItem::Shutdown);
 }
 
-fn crawler_worker3(
-    dir_rx: &Receiver<Work>,            // incoming work queue
-    dir_tx: &Sender<Work>,              // outgoing work queue
-    match_tx: &Sender<(PathBuf, i64)>,  // outgoing match queue
-    pending_dir_count: &Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
+fn process_dir(
+    dir: &PathBuf,
+    dir_tx: &Sender<WorkItem>,
+    match_tx: &Sender<(PathBuf, i64)>,
+    pending_dir_count: &Arc<AtomicU64>,
     min_file_count: i64,
-) -> LoopCtl {
-    let Ok(work) = dir_rx.recv() else {
-        error!("dir_rx error");
-        return LoopCtl::Break; //disconnected
-    };
-    let dir = match work {
-        Work::Dir(dir) => dir,
-        Work::Shutdown => {
-            // Put the shutdown signal back in the queue for the remaining workers.
-            let _ = dir_tx.send(Work::Shutdown);
-            return LoopCtl::Break;
-        }
-    };
-
+) -> MainLoopCtl {
+    // the guard guarantees pending_dir_count will be decremented even if we return early
     let guard = PendingGuard::new(&pending_dir_count);
-    let (num_files, num_rfiles) = match get_file_counts(&dir) {
+
+    let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
         Ok(v) => v,
-        // If the directory disappeared, pretend it's empty, don't just continue.
-        // this way pending_dir_count will get decremented properly at the end
-        Err(e) if e.kind() == ErrorKind::NotFound => return LoopCtl::Continue,
-        Err(_) => {
-            error!("Failed to process {:?} with error {}", dir, min_file_count);
-            let _ = dir_tx.send(Work::Shutdown);
-            return LoopCtl::Break;
+        Err(XattrError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+            // directory disappeared
+            return MainLoopCtl::Continue;
+        }
+        Err(e) => {
+            error!("Failed to process {:?} with error {:?}", dir, e);
+            return MainLoopCtl::Break;
         }
     };
 
     if num_files >= min_file_count {
         if match_tx.send((dir.clone(), num_files)).is_err() {
             error!("match_tx error");
-            let _ = dir_tx.send(Work::Shutdown);
-            return LoopCtl::Break;
+            return MainLoopCtl::Break;
         }
     }
 
@@ -257,180 +155,20 @@ fn crawler_worker3(
             // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
             // so increment before enqueue.
             pending_dir_count.fetch_add(1, Ordering::Relaxed);
-            if dir_tx.send(Work::Dir(direntry.path())).is_err() {
+            if dir_tx.send(WorkItem::Dir(direntry.path())).is_err() {
                 error!("dir_tx error");
-                let _ = dir_tx.send(Work::Shutdown);
-                return LoopCtl::Break; //disconnected
+                return MainLoopCtl::Break; //disconnected
             }
         }
     }
-    // Finish this directory.
+    // Finish this directory: .finish() will deactivate the guard
+    // so no double decrement will happen
     let prev = guard.finish();
     if prev == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
-        let _ = dir_tx.send(Work::Shutdown);
-        return LoopCtl::Break;
+        return MainLoopCtl::Break;
     }
-    LoopCtl::Continue
-}
-
-fn crawler_worker0(
-    dir_rx: Receiver<Work>,            // incoming work queue
-    dir_tx: Sender<Work>,              // outgoing work queue
-    match_tx: Sender<(PathBuf, i64)>,         // outgoing match queue
-    pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
-    min_file_count: i64,
-) {
-    loop {
-        //print!(".");
-        let Ok(work) = dir_rx.recv() else {
-            error!("dir_rx error");
-            break; // disconnected
-        };
-        let dir = match work {
-            Work::Dir(dir) => dir,
-            Work::Shutdown => {
-                //error!("shutting down");
-                // Keep the shutdown signal in the queue for the remaining workers.
-                let _ = dir_tx.send(Work::Shutdown);
-                break;
-            }
-        };
-
-        let (num_files, num_rfiles) = match get_file_counts(&dir) {
-            Ok(v) => v,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                continue;
-            }
-            Err(_) => {
-                error!("Failed to process {:?} with error {}", dir, min_file_count);
-                let _ = dir_tx.send(Work::Shutdown);
-                break;
-            }
-        };
-
-        if num_files >= min_file_count {
-            if match_tx.send((dir.clone(), num_files)).is_err() {
-                error!("match_tx error");
-                let _ = dir_tx.send(Work::Shutdown);
-                break;
-            }
-        }
-
-        if num_rfiles - num_files >= min_file_count {
-            for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let Ok(ft) = direntry.file_type() else {
-                    continue;
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
-
-                // Semantically, pending_dir_count counts queued + in-flight directories.
-                // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
-                // so increment before enqueue.
-                pending_dir_count.fetch_add(1, Ordering::Relaxed);
-                if dir_tx.send(Work::Dir(direntry.path())).is_err() {
-                    error!("dir_tx error");
-                    let _ = dir_tx.send(Work::Shutdown);
-                    break; // disconnected
-                }
-            }
-        }
-
-        // Finish this directory.
-        let prev = pending_dir_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            //error!("stopping {}", prev);
-            // Finishing this directory made pending go 1 -> 0. This means no more work.
-            let _ = dir_tx.send(Work::Shutdown);
-            break;
-        }
-        //error!("{}", prev);
-    }
-}
-
-fn crawler_worker2(
-    dir_rx: Receiver<Work>,            // incoming work queue
-    dir_tx: Sender<Work>,              // outgoing work queue
-    match_tx: Sender<(PathBuf, i64)>,  // outgoing match queue
-    pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
-    min_file_count: i64,
-) {
-    loop {
-        let Ok(work) = dir_rx.recv() else {
-            error!("dir_rx error");
-            break; // disconnected
-        };
-        let dir = match work {
-            Work::Dir(dir) => dir,
-            Work::Shutdown => {
-                //error!("shutting down");
-                // Keep the shutdown signal in the queue for the remaining workers.
-                let _ = dir_tx.send(Work::Shutdown);
-                break;
-            }
-        };
-        let guard = PendingGuard::new(&pending_dir_count);
-        let ctl: LoopCtl = (|| {
-            let (num_files, num_rfiles) = match get_file_counts(&dir) {
-                Ok(v) => v,
-                // If the directory disappeared, pretend it's empty, don't just continue.
-                // this way pending_dir_count will get decremented properly at the end
-                Err(e) if e.kind() == ErrorKind::NotFound => return LoopCtl::Continue,
-                Err(_) => {
-                    error!("Failed to process {:?} with error {}", dir, min_file_count);
-                    let _ = dir_tx.send(Work::Shutdown);
-                    return LoopCtl::Break;
-                }
-            };
-
-            if num_files >= min_file_count {
-                if match_tx.send((dir.clone(), num_files)).is_err() {
-                    error!("match_tx error");
-                    let _ = dir_tx.send(Work::Shutdown);
-                    return LoopCtl::Break;
-                }
-            }
-
-            if num_rfiles - num_files >= min_file_count {
-                for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-                    let Ok(ft) = direntry.file_type() else {
-                        continue;
-                    };
-                    if !ft.is_dir() {
-                        continue;
-                    }
-
-                    // Semantically, pending_dir_count counts queued + in-flight directories.
-                    // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
-                    // so increment before enqueue.
-                    pending_dir_count.fetch_add(1, Ordering::Relaxed);
-                    if dir_tx.send(Work::Dir(direntry.path())).is_err() {
-                        error!("dir_tx error");
-                        let _ = dir_tx.send(Work::Shutdown);
-                        return LoopCtl::Break; //disconnected
-                    }
-                }
-            }
-            LoopCtl::Continue
-        })();
-        // Finish this directory.
-        let prev = guard.finish();
-        if prev == 1 {
-            //error!("stopping {}", prev);
-            // Finishing this directory made pending go 1 -> 0. This means no more work.
-            let _ = dir_tx.send(Work::Shutdown);
-            break;
-        }
-        //error!("{}", prev);
-
-        // --- single decision point for loop control ---
-        match ctl {
-            LoopCtl::Continue => continue,
-            LoopCtl::Break => break,
-        }
-    }
+    MainLoopCtl::Continue
 }
 
 #[derive(Parser, Debug)]
@@ -464,14 +202,14 @@ fn main() {
 
     let n_workers = args.num_threads;
 
-    let (dir_tx, dir_rx) = unbounded::<Work>();
+    let (dir_tx, dir_rx) = unbounded::<WorkItem>();
     let (match_tx, match_rx) = unbounded::<(PathBuf, i64)>();
 
     let dirs_pending = Arc::new(AtomicU64::new(0));
 
     dirs_pending.fetch_add(1, Ordering::Relaxed);
     dir_tx
-        .send(Work::Dir(root))
+        .send(WorkItem::Dir(root))
         .expect("failed to enqueue root");
 
     let mut workers = Vec::with_capacity(n_workers);
@@ -481,7 +219,9 @@ fn main() {
             let dir_tx = dir_tx.clone();
             let match_tx = match_tx.clone();
             let pending = Arc::clone(&dirs_pending);
-            thread::spawn(move || crawler_worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files))
+            thread::spawn(move || {
+                crawler_worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files)
+            })
         });
     }
 
