@@ -1,18 +1,25 @@
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use log::error;
-use std::fs;
-use std::io;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    fs,
+    io,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    thread,
 };
-use std::thread;
 use xattr;
 
+
+/// Work items in the directory traversal pipeline.
+/// `Shutdown` is a *pass-along* sentinel: any worker that receives it re-sends it
+/// and then exits. This lets us shut down all workers with a single token, without
+/// requiring workers to know the total worker count.
 #[derive(Debug)]
 enum WorkItem {
     Dir(PathBuf), // process this dir
@@ -25,6 +32,9 @@ enum MainLoopCtl {
     Break,
 }
 
+/// Errors for "xattr read + parse" operations.
+/// - `NotFound` means "attribute missing" (xattr not present), not "path missing".
+/// - Path disappearance is represented as `Io(e)` where `e.kind() == ErrorKind::NotFound`.
 #[derive(Debug)]
 #[allow(dead_code)]
 enum XattrError {
@@ -33,18 +43,23 @@ enum XattrError {
     Parse(String),
     NotFound,
 }
+
 impl From<io::Error> for XattrError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
     }
 }
+
 impl From<std::str::Utf8Error> for XattrError {
     fn from(e: std::str::Utf8Error) -> Self {
         Self::Utf8(e)
     }
 }
 
-/// Ensures decrement happens even in the case of early bail-outs
+/// RAII helper ensuring we decrement the "pending directories" counter exactly once
+/// per processed directory. In the current implementation it's just for safety
+/// (easy to forget to decrement pending count if directory processing code changes)
+/// `finish()` is for clean completions where we need to check if there is more work.
 pub struct PendingCountGuard<'a> {
     count: &'a AtomicU64,
     active: bool,
@@ -71,6 +86,11 @@ impl Drop for PendingCountGuard<'_> {
     }
 }
 
+/// Read an xattr and parse it as a numeric type.
+/// - Missing xattr => `XattrError::NotFound`
+/// - Non-UTF8 => `XattrError::Utf8`
+/// - Parse failure => `XattrError::Parse(...)`
+/// - Syscall failure => `XattrError::Io(...)`
 fn get_xattr_numeric<T>(path: &Path, attr: &str) -> Result<T, XattrError>
 where
     T: FromStr,
@@ -88,7 +108,7 @@ fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
     Ok((num_files, num_rfiles))
 }
 
-fn crawler_worker_loop(
+fn worker_loop(
     dir_rx: Receiver<WorkItem>,        // incoming work queue
     dir_tx: Sender<WorkItem>,          // outgoing work queue
     match_tx: Sender<(PathBuf, i64)>,  // outgoing match queue
@@ -124,58 +144,57 @@ fn process_dir(
     // the guard guarantees pending_dir_count will be decremented even if we return early
     let guard = PendingCountGuard::new(&pending_dir_count);
 
-    let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
-        Ok(v) => v,
-        Err(XattrError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-            // directory disappeared
-            return MainLoopCtl::Continue;
-        }
-        Err(e) => {
-            error!("Failed to process {:?} with error {:?}", dir, e);
-            return MainLoopCtl::Break;
-        }
-    };
-
-    if num_files >= min_file_count {
-        if match_tx.send((dir.clone(), num_files)).is_err() {
-            error!("match_tx error");
-            return MainLoopCtl::Break;
-        }
-    }
-
-    if num_rfiles - num_files >= min_file_count {
-        for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let Ok(ft) = direntry.file_type() else {
-                continue;
-            };
-            if !ft.is_dir() {
-                continue;
+    let loop_ctl_signal = (|| -> MainLoopCtl {
+        let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
+            Ok(v) => v,
+            Err(XattrError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+                // directory disappeared
+                return MainLoopCtl::Continue;
             }
+            Err(e) => {
+                error!("Failed to process {:?} with error {:?}", dir, e);
+                return MainLoopCtl::Break;
+            }
+        };
 
-            // Semantically, pending_dir_count counts queued + in-flight directories.
-            // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
-            // so increment before enqueue.
-            pending_dir_count.fetch_add(1, Ordering::Relaxed);
-            if dir_tx.send(WorkItem::Dir(direntry.path())).is_err() {
-                error!("dir_tx error");
-                return MainLoopCtl::Break; //disconnected
+        if num_files >= min_file_count {
+            if match_tx.send((dir.clone(), num_files)).is_err() {
+                error!("match_tx error");
+                return MainLoopCtl::Break;
             }
         }
-    }
-    // Finish this directory: .finish() will deactivate the guard
-    // so no double decrement will happen
+
+        if num_rfiles - num_files >= min_file_count {
+            for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let Ok(ft) = direntry.file_type() else {
+                    continue;
+                };
+                if !ft.is_dir() {
+                    continue;
+                }
+                // Semantically, pending_dir_count counts queued + in-flight directories.
+                // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
+                // so increment before enqueue.
+                pending_dir_count.fetch_add(1, Ordering::Relaxed);
+                if dir_tx.send(WorkItem::Dir(direntry.path())).is_err() {
+                    error!("dir_tx error");
+                    return MainLoopCtl::Break; //disconnected
+                }
+            }
+        }
+        MainLoopCtl::Continue
+    })();
     let prev = guard.normal_finish();
     if prev == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
         return MainLoopCtl::Break;
     }
-    MainLoopCtl::Continue
+    loop_ctl_signal
 }
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Quickly find cephfs directories that have more than a certain number of files. \
-                    Uses cephfs extended attributes ceph.dir.{files,rfiles}."
+    about = "Quickly find cephfs dirs with many files using ceph.dir.{files,rfiles} xargs."
 )]
 struct Args {
     /// Search root
@@ -209,9 +228,7 @@ fn main() {
     let dirs_pending = Arc::new(AtomicU64::new(0));
 
     dirs_pending.fetch_add(1, Ordering::Relaxed);
-    dir_tx
-        .send(WorkItem::Dir(root))
-        .expect("failed to enqueue root");
+    dir_tx.send(WorkItem::Dir(root)).expect("failed to enqueue root");
 
     let mut workers = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
@@ -221,14 +238,13 @@ fn main() {
             let match_tx = match_tx.clone();
             let pending = Arc::clone(&dirs_pending);
             thread::spawn(move || {
-                crawler_worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files)
+                worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files)
             })
         });
     }
 
-    // Close match sender clone so match_rx ends when workers exit
+    // Close our match sender clone so match_rx ends when workers exit
     drop(match_tx);
-    // Drain matches until workers are done (all match_tx clones dropped)
     while let Ok((path, num_files)) = match_rx.recv() {
         println!("{}/ {}", path.display(), num_files);
     }
