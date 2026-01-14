@@ -2,19 +2,17 @@ use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use log::error;
 use std::{
-    fs,
-    io,
+    fs, io,
     io::ErrorKind,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     thread,
 };
 use xattr;
-
 
 /// Work items in the directory traversal pipeline.
 /// `Shutdown` is a *pass-along* sentinel: any worker that receives it re-sends it
@@ -193,9 +191,7 @@ fn process_dir(
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    about = "Quickly find cephfs dirs with many files using ceph.dir.{files,rfiles} xargs."
-)]
+#[command(about = "Quickly find cephfs dirs with many files using ceph.dir.{files,rfiles} xargs.")]
 struct Args {
     /// Search root
     #[arg(value_name = "PATH")]
@@ -228,7 +224,9 @@ fn main() {
     let dirs_pending = Arc::new(AtomicU64::new(0));
 
     dirs_pending.fetch_add(1, Ordering::Relaxed);
-    dir_tx.send(WorkItem::Dir(root)).expect("failed to enqueue root");
+    dir_tx
+        .send(WorkItem::Dir(root))
+        .expect("failed to enqueue root");
 
     let mut workers = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
@@ -237,9 +235,7 @@ fn main() {
             let dir_tx = dir_tx.clone();
             let match_tx = match_tx.clone();
             let pending = Arc::clone(&dirs_pending);
-            thread::spawn(move || {
-                worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files)
-            })
+            thread::spawn(move || worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files))
         });
     }
 
