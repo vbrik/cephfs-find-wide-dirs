@@ -44,28 +44,28 @@ impl From<std::str::Utf8Error> for XattrError {
     }
 }
 
-pub struct PendingGuard<'a> {
-    pending: &'a AtomicU64,
+pub struct PendingDirCountGuard<'a> {
+    pending_dir_count: &'a AtomicU64,
     active: bool,
 }
 
-impl<'a> PendingGuard<'a> {
+impl<'a> PendingDirCountGuard<'a> {
     pub fn new(pending: &'a AtomicU64) -> Self {
         Self {
-            pending,
+            pending_dir_count: pending,
             active: true,
         }
     }
     pub fn finish(mut self) -> u64 {
         self.active = false;
-        self.pending.fetch_sub(1, Ordering::AcqRel)
+        self.pending_dir_count.fetch_sub(1, Ordering::AcqRel)
     }
 }
 
-impl Drop for PendingGuard<'_> {
+impl Drop for PendingDirCountGuard<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.pending_dir_count.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -121,7 +121,7 @@ fn process_dir(
     min_file_count: i64,
 ) -> MainLoopCtl {
     // the guard guarantees pending_dir_count will be decremented even if we return early
-    let guard = PendingGuard::new(&pending_dir_count);
+    let guard = PendingDirCountGuard::new(&pending_dir_count);
 
     let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
         Ok(v) => v,
