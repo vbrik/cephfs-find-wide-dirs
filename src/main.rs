@@ -59,36 +59,6 @@ impl From<std::str::Utf8Error> for XattrError {
     }
 }
 
-/// RAII helper ensuring we decrement the "pending directories" counter exactly once
-/// per processed directory. In the current implementation it's just for safety
-/// (easy to forget to decrement pending count if directory processing code changes)
-/// `finish()` is for clean completions where we need to check if there is more work.
-pub struct PendingCountGuard<'a> {
-    count: &'a AtomicU64,
-    active: bool,
-}
-
-impl<'a> PendingCountGuard<'a> {
-    pub fn new(pending: &'a AtomicU64) -> Self {
-        Self {
-            count: pending,
-            active: true,
-        }
-    }
-    pub fn normal_finish(mut self) -> u64 {
-        self.active = false;
-        self.count.fetch_sub(1, Ordering::AcqRel)
-    }
-}
-
-impl Drop for PendingCountGuard<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            self.count.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
-
 /// Read an xattr and parse it as a numeric type.
 /// - Missing xattr => `XattrError::NotFound`
 /// - Non-UTF8 => `XattrError::Utf8`
@@ -147,20 +117,21 @@ fn process_dir(
     match_tx: &Sender<(PathBuf, i64)>,
     pending_dir_count: &Arc<AtomicU64>,
     min_file_count: i64,
-) -> MainLoopCtl {
-    // the guard guarantees pending_dir_count will be decremented even if we return early
-    let guard = PendingCountGuard::new(&pending_dir_count);
-
+) -> MainLoopCtl
+{
+    // This scope guard is to ensure that pending_dir_count is correctly decremented
+    // upon completion of processing of every directory, even if we need bail early.
+    // No-more-work condition must also always be checked.
+    // even if processing fails, and
+    // we return early.
     let loop_ctl_signal = (|| -> MainLoopCtl {
         let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
             Ok(v) => v,
             Err(XattrError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-                // directory disappeared
-                dbg!("{}", dir.display());
+                // directory disappeared -- this is expected
                 return MainLoopCtl::Continue;
             }
             Err(e) => {
-                dbg!("{}", dir.display());
                 error!("Failed to process {:?} with error {:?}", dir, e);
                 return MainLoopCtl::Break;
             }
@@ -184,7 +155,7 @@ fn process_dir(
                 // Semantically, pending_dir_count counts queued + in-flight directories.
                 // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
                 // so increment before enqueue.
-                pending_dir_count.fetch_add(1, Ordering::Relaxed);
+                pending_dir_count.fetch_add(1, Ordering::Relaxed); // no idea why Relaxed; Release?
                 if dir_tx.send(WorkItem::Dir(direntry.path())).is_err() {
                     error!("dir_tx error");
                     return MainLoopCtl::Break; //disconnected
@@ -193,7 +164,7 @@ fn process_dir(
         }
         MainLoopCtl::Continue
     })();
-    let prev = guard.normal_finish();
+    let prev = pending_dir_count.fetch_sub(1, Ordering::AcqRel); // don't know why AcqRel
     if prev == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
         return MainLoopCtl::Break;
@@ -249,6 +220,7 @@ fn main() {
 
     // A counter to detect when there is no more work to be done.
     // dirs_pending >= dirs pending processing + dirs being processed
+    // (I don't understand Arc or AtomicU64)
     let dirs_pending = Arc::new(AtomicU64::new(0));
 
     dirs_pending.fetch_add(1, Ordering::Relaxed);
