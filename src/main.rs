@@ -44,28 +44,29 @@ impl From<std::str::Utf8Error> for XattrError {
     }
 }
 
-pub struct PendingDirCountGuard<'a> {
-    pending_dir_count: &'a AtomicU64,
+/// Ensures decrement happens even in the case of early bail-outs
+pub struct PendingCountGuard<'a> {
+    count: &'a AtomicU64,
     active: bool,
 }
 
-impl<'a> PendingDirCountGuard<'a> {
+impl<'a> PendingCountGuard<'a> {
     pub fn new(pending: &'a AtomicU64) -> Self {
         Self {
-            pending_dir_count: pending,
+            count: pending,
             active: true,
         }
     }
-    pub fn finish(mut self) -> u64 {
+    pub fn normal_finish(mut self) -> u64 {
         self.active = false;
-        self.pending_dir_count.fetch_sub(1, Ordering::AcqRel)
+        self.count.fetch_sub(1, Ordering::AcqRel)
     }
 }
 
-impl Drop for PendingDirCountGuard<'_> {
+impl Drop for PendingCountGuard<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.pending_dir_count.fetch_sub(1, Ordering::AcqRel);
+            self.count.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -88,8 +89,8 @@ fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
 }
 
 fn crawler_worker_loop(
-    dir_rx: Receiver<WorkItem>,            // incoming work queue
-    dir_tx: Sender<WorkItem>,              // outgoing work queue
+    dir_rx: Receiver<WorkItem>,        // incoming work queue
+    dir_tx: Sender<WorkItem>,          // outgoing work queue
     match_tx: Sender<(PathBuf, i64)>,  // outgoing match queue
     pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
     min_file_count: i64,
@@ -121,7 +122,7 @@ fn process_dir(
     min_file_count: i64,
 ) -> MainLoopCtl {
     // the guard guarantees pending_dir_count will be decremented even if we return early
-    let guard = PendingDirCountGuard::new(&pending_dir_count);
+    let guard = PendingCountGuard::new(&pending_dir_count);
 
     let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
         Ok(v) => v,
@@ -163,7 +164,7 @@ fn process_dir(
     }
     // Finish this directory: .finish() will deactivate the guard
     // so no double decrement will happen
-    let prev = guard.finish();
+    let prev = guard.normal_finish();
     if prev == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
         return MainLoopCtl::Break;
