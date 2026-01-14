@@ -2,17 +2,22 @@ use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use log::error;
 use std::{
-    fs, io,
+    fs,
+    io,
     io::ErrorKind,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
+        OnceLock
     },
     thread,
 };
 use xattr;
+
+// Debug mode where we match all dirs without looking at xattrs
+static DEBUG_NO_XATTRS: OnceLock<bool> = OnceLock::new();
 
 /// Work items in the directory traversal pipeline.
 /// `Shutdown` is a *pass-along* sentinel: any worker that receives it re-sends it
@@ -101,9 +106,13 @@ where
 }
 
 fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
-    let num_files: i64 = get_xattr_numeric(dir, "ceph.dir.files")?;
-    let num_rfiles: i64 = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
-    Ok((num_files, num_rfiles))
+    if *DEBUG_NO_XATTRS.get().expect("DEBUG_NO_XATTRS not set") {
+        Ok((0, 0))
+    } else {
+        let num_files: i64 = get_xattr_numeric(dir, "ceph.dir.files")?;
+        let num_rfiles: i64 = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
+        Ok((num_files, num_rfiles))
+    }
 }
 
 fn worker_loop(
@@ -147,9 +156,11 @@ fn process_dir(
             Ok(v) => v,
             Err(XattrError::Io(e)) if e.kind() == ErrorKind::NotFound => {
                 // directory disappeared
+                dbg!("{}", dir.display());
                 return MainLoopCtl::Continue;
             }
             Err(e) => {
+                dbg!("{}", dir.display());
                 error!("Failed to process {:?} with error {:?}", dir, e);
                 return MainLoopCtl::Break;
             }
@@ -197,24 +208,35 @@ struct Args {
     #[arg(value_name = "PATH")]
     search_root: String,
 
-    /// Minimum number of files
+    /// Minimum number of files (0 => ignore xattrs, match all).
     #[arg(short, long = "min-num-files", value_name = "NUMBER",
-    value_parser = clap::value_parser!(i64).range(1..))]
+    value_parser = clap::value_parser!(i64).range(0..))]
     min_files: i64,
 
-    /// Number of threads (1-64)
+    /// Number of threads (1-64).
     #[arg(short, long = "threads", value_name = "NUMBER", default_value_t = 16,
     value_parser = clap::value_parser!(u32).range(1..=64))]
     num_threads: u32,
+
+    /// Debug mode: use user.ceph.dir.{files,rfiles} xattrs.
+    #[arg(long)]
+    test: bool,
 }
 
 fn main() {
     env_logger::init();
     let args = Args::parse();
 
+    if args.min_files == 0 {
+        eprintln!("Debug mode: ignoring xattrs");
+        DEBUG_NO_XATTRS.set(true).unwrap();
+    } else {
+        DEBUG_NO_XATTRS.set(false).unwrap();
+    }
+
     let root = PathBuf::from(args.search_root);
     if !root.is_dir() {
-        eprintln!("error: not a directory: {:?}", root);
+        eprintln!("error: not a directory or permission denied: {:?}", root);
         std::process::exit(2);
     }
 
