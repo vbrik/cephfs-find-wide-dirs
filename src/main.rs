@@ -198,12 +198,14 @@ struct Args {
     search_root: String,
 
     /// Minimum number of files
-    #[arg(short, long = "min-num-files", value_name = "NUMBER")]
+    #[arg(short, long = "min-num-files", value_name = "NUMBER",
+    value_parser = clap::value_parser!(i64).range(1..))]
     min_files: i64,
 
-    /// Number of threads
-    #[arg(short, long = "threads", value_name = "NUMBER", default_value_t = 16)]
-    num_threads: usize,
+    /// Number of threads (1-64)
+    #[arg(short, long = "threads", value_name = "NUMBER", default_value_t = 16,
+    value_parser = clap::value_parser!(u32).range(1..=64))]
+    num_threads: u32,
 }
 
 fn main() {
@@ -216,11 +218,15 @@ fn main() {
         std::process::exit(2);
     }
 
-    let n_workers = args.num_threads;
+    let n_workers: usize = args.num_threads as usize;
 
+    // Channel for directories that need to be processed (workers send and receive)
     let (dir_tx, dir_rx) = unbounded::<WorkItem>();
+    // Channel for directories that match the criteria (workers send to main)
     let (match_tx, match_rx) = unbounded::<(PathBuf, i64)>();
 
+    // A counter to detect when there is no more work to be done.
+    // dirs_pending >= dirs pending processing + dirs being processed
     let dirs_pending = Arc::new(AtomicU64::new(0));
 
     dirs_pending.fetch_add(1, Ordering::Relaxed);
@@ -239,7 +245,8 @@ fn main() {
         });
     }
 
-    // Close our match sender clone so match_rx ends when workers exit
+    // Close our match sender so match_rx disconnects when workers exit,
+    // so that we know when there is no more work to be done.
     drop(match_tx);
     while let Ok((path, num_files)) = match_rx.recv() {
         println!("{}/ {}", path.display(), num_files);
