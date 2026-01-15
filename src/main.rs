@@ -9,22 +9,23 @@ use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use log::error;
 use std::{
-    fs,
-    io,
+    fs, io,
     io::ErrorKind,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        OnceLock
     },
     thread,
 };
 use xattr;
 
-// Debug mode where we match all dirs without looking at xattrs
-static DEBUG_NO_XATTRS: OnceLock<bool> = OnceLock::new();
+#[derive(Debug, Clone, Copy)]
+struct DebugFlags {
+    /// Match all dirs without looking at xattrs
+    no_xattrs: bool,
+}
 
 /// Work items in the directory traversal pipeline.
 /// `Shutdown` is a *pass-along* sentinel: any worker that receives it re-sends it
@@ -73,15 +74,16 @@ where
     let bytes = xattr::get(path, attr)?.ok_or(XattrError::AttrNotFound)?;
     let s = std::str::from_utf8(&bytes)?;
     let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    s.parse::<T>().map_err(|e| XattrError::ParseError(e.to_string()))
+    s.parse::<T>()
+        .map_err(|e| XattrError::ParseError(e.to_string()))
 }
 
-fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
-    if *DEBUG_NO_XATTRS.get().expect("DEBUG_NO_XATTRS not set") {
+fn get_file_counts_numeric(dir: &Path, dbg: DebugFlags) -> Result<(u32, u32), XattrError> {
+    if dbg.no_xattrs {
         Ok((0, 0))
     } else {
-        let num_files: i64 = get_xattr_numeric(dir, "ceph.dir.files")?;
-        let num_rfiles: i64 = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
+        let num_files: u32 = get_xattr_numeric(dir, "ceph.dir.files")?;
+        let num_rfiles: u32 = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
         Ok((num_files, num_rfiles))
     }
 }
@@ -90,9 +92,10 @@ fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
 fn worker_loop(
     dir_rx: Receiver<WorkItem>,        // incoming work queue
     dir_tx: Sender<WorkItem>,          // outgoing work queue
-    match_tx: Sender<(PathBuf, i64)>,  // outgoing match queue
+    match_tx: Sender<(PathBuf, u32)>,  // outgoing match queue
     pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
-    min_file_count: i64,
+    min_file_count: u32,
+    dbg: DebugFlags,
 ) {
     loop {
         let Ok(work) = dir_rx.recv() else {
@@ -105,7 +108,14 @@ fn worker_loop(
                 break;
             }
         };
-        match process_dir(&dir, &dir_tx, &match_tx, &pending_dir_count, min_file_count) {
+        match process_dir(
+            &dir,
+            &dir_tx,
+            &match_tx,
+            &pending_dir_count,
+            min_file_count,
+            dbg,
+        ) {
             MainLoopCtl::Continue => continue,
             MainLoopCtl::Break => break,
         }
@@ -117,17 +127,17 @@ fn worker_loop(
 fn process_dir(
     dir: &PathBuf,
     dir_tx: &Sender<WorkItem>,
-    match_tx: &Sender<(PathBuf, i64)>,
+    match_tx: &Sender<(PathBuf, u32)>,
     pending_dir_count: &Arc<AtomicU64>,
-    min_file_count: i64,
-) -> MainLoopCtl
-{
+    min_file_count: u32,
+    dbg: DebugFlags,
+) -> MainLoopCtl {
     // This scope guard is to ensure that pending_dir_count is correctly decremented
     // upon completion of processing of every directory, even if we need bail early.
     // No-more-work condition must also always be checked even if processing fails,
     // and we return early (otherwise we may get stuck).
     let loop_ctl_signal = (|| -> MainLoopCtl {
-        let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
+        let (num_files, num_rfiles) = match get_file_counts_numeric(&dir, dbg) {
             Ok(v) => v,
             Err(XattrError::IoError(e)) if e.kind() == ErrorKind::NotFound => {
                 // directory disappeared -- this is normal
@@ -146,7 +156,7 @@ fn process_dir(
             }
         }
 
-        if num_rfiles - num_files >= min_file_count {
+        if num_rfiles.saturating_sub(num_files) >= min_file_count {
             // subtrees may contain directories with many files, so need to descend
             for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let Ok(ft) = direntry.file_type() else {
@@ -177,7 +187,7 @@ fn process_dir(
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Quickly find cephfs dirs with many files using ceph.dir.{files,rfiles} xargs.")]
+#[command(about = "Quickly find cephfs dirs with many files using ceph.dir.{files,rfiles} xattrs.")]
 struct Args {
     /// Search root directory.
     #[arg(value_name = "PATH")]
@@ -185,8 +195,8 @@ struct Args {
 
     /// Minimum number of files (0 => don't read xattrs, match all).
     #[arg(short, long = "min-num-files", value_name = "NUMBER",
-    value_parser = clap::value_parser!(i64).range(0..))]
-    min_files: i64,
+    value_parser = clap::value_parser!(u32).range(0..))]
+    min_files: u32,
 
     /// Number of threads (1-64).
     #[arg(short, long = "threads", value_name = "NUMBER", default_value_t = 16,
@@ -198,11 +208,11 @@ fn main() {
     env_logger::init();
     let args = Args::parse();
 
-    if args.min_files == 0 {
+    let dbg = DebugFlags {
+        no_xattrs: args.min_files == 0,
+    };
+    if dbg.no_xattrs {
         eprintln!("Debug mode: ignoring xattrs");
-        DEBUG_NO_XATTRS.set(true).unwrap();
-    } else {
-        DEBUG_NO_XATTRS.set(false).unwrap();
     }
 
     let root = PathBuf::from(args.search_root);
@@ -211,12 +221,12 @@ fn main() {
         std::process::exit(2);
     }
 
-    let n_workers: usize = args.num_threads as usize;
+    let n_workers: usize = args.num_threads.try_into().expect("conversion");
 
     // Channel for directories that need to be processed (workers send and receive)
     let (dir_tx, dir_rx) = unbounded::<WorkItem>();
     // Channel for directories that match the criteria (workers send to main)
-    let (match_tx, match_rx) = unbounded::<(PathBuf, i64)>();
+    let (match_tx, match_rx) = unbounded::<(PathBuf, u32)>();
 
     // A counter to detect when there is no more work to be done.
     // dirs_pending >= dirs pending processing + dirs being processed
@@ -234,8 +244,9 @@ fn main() {
             let dir_tx = dir_tx.clone();
             let match_tx = match_tx.clone();
             let pending = Arc::clone(&dirs_pending);
-            thread::spawn(move ||
-                worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files))
+            thread::spawn(move || {
+                worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files, dbg)
+            })
         });
     }
 
