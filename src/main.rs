@@ -1,3 +1,10 @@
+//! Traverse a cephfs directory tree and identify directories with many files.
+//! Very fast because multithreaded and uses ceph.dir.rfiles xattrs to skip subtrees
+//! that don't contain enough files.
+//!
+//! This tool was conceived as an exercise for learning rust, so it's a bit over-engineered
+//! (e.g. multithreading is an overkill)
+
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use log::error;
@@ -26,7 +33,7 @@ static DEBUG_NO_XATTRS: OnceLock<bool> = OnceLock::new();
 #[derive(Debug)]
 enum WorkItem {
     Dir(PathBuf), // process this dir
-    Shutdown,     // shut down
+    Shutdown,     // everybody shut down
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,43 +43,37 @@ enum MainLoopCtl {
 }
 
 /// Errors for "xattr read + parse" operations.
-/// - `NotFound` means "attribute missing" (xattr not present), not "path missing".
-/// - Path disappearance is represented as `Io(e)` where `e.kind() == ErrorKind::NotFound`.
 #[derive(Debug)]
 #[allow(dead_code)]
 enum XattrError {
-    Io(io::Error),
-    Utf8(std::str::Utf8Error),
-    Parse(String),
-    NotFound,
+    IoError(io::Error),
+    Utf8Error(std::str::Utf8Error),
+    ParseError(String),
+    AttrNotFound,
 }
 
 impl From<io::Error> for XattrError {
     fn from(e: io::Error) -> Self {
-        Self::Io(e)
+        Self::IoError(e)
     }
 }
 
 impl From<std::str::Utf8Error> for XattrError {
     fn from(e: std::str::Utf8Error) -> Self {
-        Self::Utf8(e)
+        Self::Utf8Error(e)
     }
 }
 
 /// Read an xattr and parse it as a numeric type.
-/// - Missing xattr => `XattrError::NotFound`
-/// - Non-UTF8 => `XattrError::Utf8`
-/// - Parse failure => `XattrError::Parse(...)`
-/// - Syscall failure => `XattrError::Io(...)`
 fn get_xattr_numeric<T>(path: &Path, attr: &str) -> Result<T, XattrError>
 where
     T: FromStr,
     T::Err: std::fmt::Display,
 {
-    let bytes = xattr::get(path, attr)?.ok_or(XattrError::NotFound)?;
+    let bytes = xattr::get(path, attr)?.ok_or(XattrError::AttrNotFound)?;
     let s = std::str::from_utf8(&bytes)?;
     let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    s.parse::<T>().map_err(|e| XattrError::Parse(e.to_string()))
+    s.parse::<T>().map_err(|e| XattrError::ParseError(e.to_string()))
 }
 
 fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
@@ -85,6 +86,7 @@ fn get_file_counts_numeric(dir: &Path) -> Result<(i64, i64), XattrError> {
     }
 }
 
+/// Main worker loop
 fn worker_loop(
     dir_rx: Receiver<WorkItem>,        // incoming work queue
     dir_tx: Sender<WorkItem>,          // outgoing work queue
@@ -94,7 +96,7 @@ fn worker_loop(
 ) {
     loop {
         let Ok(work) = dir_rx.recv() else {
-            error!("dir_rx error");
+            error!("Fatal: dir_rx disconnected");
             break;
         };
         let dir = match work {
@@ -111,6 +113,7 @@ fn worker_loop(
     let _ = dir_tx.send(WorkItem::Shutdown);
 }
 
+/// Process a single directory
 fn process_dir(
     dir: &PathBuf,
     dir_tx: &Sender<WorkItem>,
@@ -121,30 +124,30 @@ fn process_dir(
 {
     // This scope guard is to ensure that pending_dir_count is correctly decremented
     // upon completion of processing of every directory, even if we need bail early.
-    // No-more-work condition must also always be checked.
-    // even if processing fails, and
-    // we return early.
+    // No-more-work condition must also always be checked even if processing fails,
+    // and we return early (otherwise we may get stuck).
     let loop_ctl_signal = (|| -> MainLoopCtl {
         let (num_files, num_rfiles) = match get_file_counts_numeric(&dir) {
             Ok(v) => v,
-            Err(XattrError::Io(e)) if e.kind() == ErrorKind::NotFound => {
-                // directory disappeared -- this is expected
+            Err(XattrError::IoError(e)) if e.kind() == ErrorKind::NotFound => {
+                // directory disappeared -- this is normal
                 return MainLoopCtl::Continue;
             }
             Err(e) => {
-                error!("Failed to process {:?} with error {:?}", dir, e);
+                error!("Fatal: failed to process {:?}: {:?}", dir, e);
                 return MainLoopCtl::Break;
             }
         };
 
         if num_files >= min_file_count {
             if match_tx.send((dir.clone(), num_files)).is_err() {
-                error!("match_tx error");
+                error!("Fatal: match_tx disconnected");
                 return MainLoopCtl::Break;
             }
         }
 
         if num_rfiles - num_files >= min_file_count {
+            // subtrees may contain directories with many files, so need to descend
             for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let Ok(ft) = direntry.file_type() else {
                     continue;
@@ -157,13 +160,14 @@ fn process_dir(
                 // so increment before enqueue.
                 pending_dir_count.fetch_add(1, Ordering::Relaxed); // no idea why Relaxed; Release?
                 if dir_tx.send(WorkItem::Dir(direntry.path())).is_err() {
-                    error!("dir_tx error");
-                    return MainLoopCtl::Break; //disconnected
+                    error!("Fatal: dir_tx disconnected");
+                    return MainLoopCtl::Break;
                 }
             }
         }
         MainLoopCtl::Continue
     })();
+
     let prev = pending_dir_count.fetch_sub(1, Ordering::AcqRel); // don't know why AcqRel
     if prev == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
@@ -175,11 +179,11 @@ fn process_dir(
 #[derive(Parser, Debug)]
 #[command(about = "Quickly find cephfs dirs with many files using ceph.dir.{files,rfiles} xargs.")]
 struct Args {
-    /// Search root
+    /// Search root directory.
     #[arg(value_name = "PATH")]
     search_root: String,
 
-    /// Minimum number of files (0 => ignore xattrs, match all).
+    /// Minimum number of files (0 => don't read xattrs, match all).
     #[arg(short, long = "min-num-files", value_name = "NUMBER",
     value_parser = clap::value_parser!(i64).range(0..))]
     min_files: i64,
@@ -188,10 +192,6 @@ struct Args {
     #[arg(short, long = "threads", value_name = "NUMBER", default_value_t = 16,
     value_parser = clap::value_parser!(u32).range(1..=64))]
     num_threads: u32,
-
-    /// Debug mode: use user.ceph.dir.{files,rfiles} xattrs.
-    #[arg(long)]
-    test: bool,
 }
 
 fn main() {
@@ -220,13 +220,12 @@ fn main() {
 
     // A counter to detect when there is no more work to be done.
     // dirs_pending >= dirs pending processing + dirs being processed
-    // (I don't understand Arc or AtomicU64)
     let dirs_pending = Arc::new(AtomicU64::new(0));
 
     dirs_pending.fetch_add(1, Ordering::Relaxed);
     dir_tx
         .send(WorkItem::Dir(root))
-        .expect("failed to enqueue root");
+        .expect("Must be able to enqueue root");
 
     let mut workers = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
@@ -235,11 +234,12 @@ fn main() {
             let dir_tx = dir_tx.clone();
             let match_tx = match_tx.clone();
             let pending = Arc::clone(&dirs_pending);
-            thread::spawn(move || worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files))
+            thread::spawn(move ||
+                worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files))
         });
     }
 
-    // Close our match sender so match_rx disconnects when workers exit,
+    // Close our match sender so match_rx disconnects when all workers exit,
     // so that we know when there is no more work to be done.
     drop(match_tx);
     while let Ok((path, num_files)) = match_rx.recv() {
