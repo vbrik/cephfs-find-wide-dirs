@@ -156,9 +156,27 @@ fn process_dir(
             }
         }
 
+        // subtrees may contain directories with many files, so need to descend
         if num_rfiles.saturating_sub(num_files) >= min_file_count {
-            // subtrees may contain directories with many files, so need to descend
-            for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let rd = match fs::read_dir(dir) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    // directory disappearances are normal
+                    return MainLoopCtl::Continue;
+                }
+                Err(e) => {
+                    error!("Fatal: failed to process {:?}: {:?}", dir, e);
+                    return MainLoopCtl::Break;
+                }
+            };
+            for entry_res in rd {
+                let direntry = match entry_res {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error!("Skipping entry in {:?}: {:?}", dir, e);
+                        return MainLoopCtl::Break;
+                    }
+                };
                 let Ok(ft) = direntry.file_type() else {
                     continue;
                 };
@@ -173,7 +191,7 @@ fn process_dir(
                     error!("Fatal: dir_tx disconnected");
                     return MainLoopCtl::Break;
                 }
-            }
+            };
         }
         MainLoopCtl::Continue
     })();
