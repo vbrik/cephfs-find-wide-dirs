@@ -2,6 +2,8 @@
 //! Very fast because multithreaded and uses ceph.dir.rfiles xattrs to skip subtrees
 //! that don't contain enough files.
 //!
+//! Except for disappearing directories all errors treated as fatal (e.g. permissions).
+//!
 //! This tool was conceived as an exercise for learning rust, so it's a bit over-engineered
 //! (e.g. multithreading is an overkill)
 
@@ -78,14 +80,61 @@ where
         .map_err(|e| XattrError::ParseError(e.to_string()))
 }
 
-fn get_file_counts_numeric(dir: &Path, dbg: DebugFlags) -> Result<(u32, u32), XattrError> {
-    if dbg.no_xattrs {
-        Ok((0, 0))
-    } else {
-        let num_files: u32 = get_xattr_numeric(dir, "ceph.dir.files")?;
-        let num_rfiles: u32 = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
-        Ok((num_files, num_rfiles))
+fn get_file_counts_numeric(dir: &Path) -> Result<(u32, u32), XattrError> {
+    let num_files: u32 = get_xattr_numeric(dir, "ceph.dir.files")?;
+    let num_rfiles: u32 = get_xattr_numeric(dir, "ceph.dir.rfiles")?;
+    Ok((num_files, num_rfiles))
+}
+
+fn get_file_counts_numeric_ctl(dir: &Path) -> Result<(u32, u32), MainLoopCtl> {
+    let counts = match get_file_counts_numeric(&dir) {
+        Ok(v) => v,
+        Err(XattrError::IoError(e)) if e.kind() == ErrorKind::NotFound => {
+            // directory disappeared -- this is expected
+            return Err(MainLoopCtl::Continue);
+        }
+        Err(e) => {
+            error!("Fatal: failed to process {:?}: {:?}", dir, e);
+            return Err(MainLoopCtl::Break);
+        }
+    };
+    Ok(counts)
+}
+
+fn get_subdirs_ctl(dir: &PathBuf) -> Result<Vec<PathBuf>, MainLoopCtl> {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // directory disappearances are normal
+            return Err(MainLoopCtl::Continue);
+        }
+        Err(e) => {
+            error!("Fatal: failed to process {:?}: {:?}", dir, e);
+            return Err(MainLoopCtl::Break);
+        }
+    };
+    let mut subdirs = Vec::<PathBuf>::new();
+    for entry_res in read_dir {
+        let direntry = match entry_res {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Skipping entry in {:?}: {:?}", dir, e);
+                return Err(MainLoopCtl::Break);
+            }
+        };
+        let ft = match direntry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                error!("File type error {:?} {:?} {:?}", dir, direntry.path(), e);
+                return Err(MainLoopCtl::Break);
+            }
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        subdirs.push(direntry.path());
     }
+    Ok(subdirs)
 }
 
 /// Main worker loop
@@ -108,14 +157,9 @@ fn worker_loop(
                 break;
             }
         };
-        match process_dir(
-            &dir,
-            &dir_tx,
-            &match_tx,
-            &pending_dir_count,
-            min_file_count,
-            dbg,
-        ) {
+        #[rustfmt::skip]
+        let ctl = process_dir(&dir, &dir_tx, &match_tx, &pending_dir_count, min_file_count, dbg);
+        match ctl {
             MainLoopCtl::Continue => continue,
             MainLoopCtl::Break => break,
         }
@@ -132,72 +176,49 @@ fn process_dir(
     min_file_count: u32,
     dbg: DebugFlags,
 ) -> MainLoopCtl {
-    // This scope guard is to ensure that pending_dir_count is correctly decremented
-    // upon completion of processing of every directory, even if we need bail early.
-    // No-more-work condition must also always be checked even if processing fails,
-    // and we return early (otherwise we may get stuck).
+    // This function must not return before updating pending_dir_count,
+    // even if problems are encountered. To accomplish this, actual directory
+    // processing is done inside the closure below.
     let loop_ctl_signal = (|| -> MainLoopCtl {
-        let (num_files, num_rfiles) = match get_file_counts_numeric(&dir, dbg) {
-            Ok(v) => v,
-            Err(XattrError::IoError(e)) if e.kind() == ErrorKind::NotFound => {
-                // directory disappeared -- this is normal
-                return MainLoopCtl::Continue;
+        let (num_files, num_rfiles) = if !dbg.no_xattrs {
+            match get_file_counts_numeric_ctl(&dir) {
+                Ok(v) => v,
+                Err(loop_signal) => return loop_signal,
             }
-            Err(e) => {
-                error!("Fatal: failed to process {:?}: {:?}", dir, e);
-                return MainLoopCtl::Break;
-            }
+        } else {
+            (0, 0)
         };
 
-        if num_files >= min_file_count {
+        // Are we a match?
+        if num_files >= min_file_count || dbg.no_xattrs {
             if match_tx.send((dir.clone(), num_files)).is_err() {
                 error!("Fatal: match_tx disconnected");
                 return MainLoopCtl::Break;
             }
         }
 
-        // subtrees may contain directories with many files, so need to descend
-        if num_rfiles.saturating_sub(num_files) >= min_file_count {
-            let rd = match fs::read_dir(dir) {
-                Ok(rd) => rd,
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    // directory disappearances are normal
-                    return MainLoopCtl::Continue;
-                }
-                Err(e) => {
-                    error!("Fatal: failed to process {:?}: {:?}", dir, e);
-                    return MainLoopCtl::Break;
-                }
+        // Do we need to traverse subdirs?
+        if num_rfiles.saturating_sub(num_files) >= min_file_count || dbg.no_xattrs {
+            let subdir_paths = match get_subdirs_ctl(&dir) {
+                Ok(v) => v,
+                Err(loop_signal) => return loop_signal,
             };
-            for entry_res in rd {
-                let direntry = match entry_res {
-                    Ok(e) => e,
-                    Err(e) => {
-                        error!("Skipping entry in {:?}: {:?}", dir, e);
-                        return MainLoopCtl::Break;
-                    }
-                };
-                let Ok(ft) = direntry.file_type() else {
-                    continue;
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
+            for path in subdir_paths {
                 // Semantically, pending_dir_count counts queued + in-flight directories.
                 // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
                 // so increment before enqueue.
                 pending_dir_count.fetch_add(1, Ordering::Relaxed); // no idea why Relaxed; Release?
-                if dir_tx.send(WorkItem::Dir(direntry.path())).is_err() {
+                if dir_tx.send(WorkItem::Dir(path)).is_err() {
                     error!("Fatal: dir_tx disconnected");
                     return MainLoopCtl::Break;
                 }
-            };
+            }
         }
         MainLoopCtl::Continue
     })();
 
-    let prev = pending_dir_count.fetch_sub(1, Ordering::AcqRel); // don't know why AcqRel
-    if prev == 1 {
+    // don't know why AcqRel
+    if pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
         return MainLoopCtl::Break;
     }
