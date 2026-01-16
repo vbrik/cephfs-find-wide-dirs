@@ -1,11 +1,11 @@
-//! Traverse a cephfs directory tree and identify directories with many files.
-//! Very fast because multithreaded and uses ceph.dir.rfiles xattrs to skip subtrees
-//! that don't contain enough files.
+//! Traverse a cephfs directory tree and identify directories with too many files.
+//! Very fast because it's multithreaded and uses ceph.dir.rfiles xattrs to skip
+//! subtrees with too few files.
 //!
 //! Except for disappearing directories all errors treated as fatal (e.g. permissions).
 //!
-//! This tool was conceived as an exercise for learning rust, so it's a bit over-engineered
-//! (e.g. multithreading is an overkill)
+//! This tool was conceived as an exercise for learning Rust, so it's a bit
+//! over-engineered for what it is.
 
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
