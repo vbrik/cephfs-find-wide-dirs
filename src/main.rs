@@ -21,7 +21,9 @@ use std::{
     },
     thread,
 };
+use thiserror::Error;
 use xattr;
+
 
 #[derive(Debug, Clone, Copy)]
 struct DebugFlags {
@@ -46,24 +48,39 @@ enum MainLoopCtl {
 }
 
 /// Errors for "xattr read + parse" operations.
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Debug, Error)]
 enum XattrError {
-    IoError(io::Error),
-    Utf8Error(std::str::Utf8Error),
-    ParseError(String),
-    AttrNotFound,
+    #[error("I/O error while reading xattr `{attr}` on {path}: {source}")]
+    Io {
+        path: PathBuf,
+        attr: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("xattr `{attr}` missing on {path}")]
+    MissingXattr { path: PathBuf, attr: String },
+
+    #[error("xattr `{attr}` on {path} is not valid UTF-8: {source}")]
+    Utf8 {
+        path: PathBuf,
+        attr: String,
+        #[source]
+        source: std::str::Utf8Error,
+    },
+
+    #[error("xattr `{attr}` on {path} failed to parse as {ty}: {msg}")]
+    Parse {
+        path: PathBuf,
+        attr: String,
+        ty: &'static str,
+        msg: String,
+    },
 }
 
-impl From<io::Error> for XattrError {
-    fn from(e: io::Error) -> Self {
-        Self::IoError(e)
-    }
-}
-
-impl From<std::str::Utf8Error> for XattrError {
-    fn from(e: std::str::Utf8Error) -> Self {
-        Self::Utf8Error(e)
+impl XattrError {
+    pub fn is_path_not_found(&self) -> bool {
+        matches!(self, XattrError::Io { source, .. } if source.kind() == ErrorKind::NotFound)
     }
 }
 
@@ -73,11 +90,29 @@ where
     T: FromStr,
     T::Err: std::fmt::Display,
 {
-    let bytes = xattr::get(path, attr)?.ok_or(XattrError::AttrNotFound)?;
-    let s = std::str::from_utf8(&bytes)?;
+    let bytes = xattr::get(path, attr).map_err(|e| XattrError::Io {
+        path: path.to_owned(),
+        attr: attr.to_owned(),
+        source: e,
+    })?;
+    let bytes = bytes.ok_or_else(|| XattrError::MissingXattr {
+        path: path.to_owned(),
+        attr: attr.to_owned(),
+    })?;
+
+    let s = std::str::from_utf8(&bytes).map_err(|e| XattrError::Utf8 {
+        path: path.to_owned(),
+        attr: attr.to_owned(),
+        source: e,
+    })?;
+
     let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    s.parse::<T>()
-        .map_err(|e| XattrError::ParseError(e.to_string()))
+    s.parse::<T>().map_err(|e| XattrError::Parse {
+        path: path.to_owned(),
+        attr: attr.to_owned(),
+        ty: std::any::type_name::<T>(),
+        msg: e.to_string(),
+    })
 }
 
 fn get_file_counts_numeric(dir: &Path) -> Result<(u32, u32), XattrError> {
@@ -89,7 +124,7 @@ fn get_file_counts_numeric(dir: &Path) -> Result<(u32, u32), XattrError> {
 fn get_file_counts_numeric_ctl(dir: &Path) -> Result<(u32, u32), MainLoopCtl> {
     let counts = match get_file_counts_numeric(&dir) {
         Ok(v) => v,
-        Err(XattrError::IoError(e)) if e.kind() == ErrorKind::NotFound => {
+        Err(e) if e.is_path_not_found() => {
             // directory disappeared -- this is expected
             return Err(MainLoopCtl::Continue);
         }
@@ -101,7 +136,7 @@ fn get_file_counts_numeric_ctl(dir: &Path) -> Result<(u32, u32), MainLoopCtl> {
     Ok(counts)
 }
 
-fn get_subdirs_ctl(dir: &PathBuf) -> Result<Vec<PathBuf>, MainLoopCtl> {
+fn get_subdirs_ctl(dir: &Path) -> Result<Vec<PathBuf>, MainLoopCtl> {
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -157,8 +192,14 @@ fn worker_loop(
                 break;
             }
         };
-        #[rustfmt::skip]
-        let ctl = process_dir(&dir, &dir_tx, &match_tx, &pending_dir_count, min_file_count, dbg);
+        let ctl = process_dir(
+            &dir,
+            &dir_tx,
+            &match_tx,
+            &pending_dir_count,
+            min_file_count,
+            dbg,
+        );
         match ctl {
             MainLoopCtl::Continue => continue,
             MainLoopCtl::Break => break,
@@ -207,7 +248,7 @@ fn process_dir(
                 // Semantically, pending_dir_count counts queued + in-flight directories.
                 // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
                 // so increment before enqueue.
-                pending_dir_count.fetch_add(1, Ordering::Relaxed); // no idea why Relaxed; Release?
+                pending_dir_count.fetch_add(1, Ordering::Relaxed);
                 if dir_tx.send(WorkItem::Dir(path)).is_err() {
                     error!("Fatal: dir_tx disconnected");
                     return MainLoopCtl::Break;
@@ -217,7 +258,6 @@ fn process_dir(
         MainLoopCtl::Continue
     })();
 
-    // don't know why AcqRel
     if pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
         return MainLoopCtl::Break;
