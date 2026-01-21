@@ -116,8 +116,18 @@ fn get_file_counts_numeric(dir: &Path) -> Result<(u32, u32), XattrError> {
 }
 
 fn get_subdirs(dir: &Path) -> Result<Vec<PathBuf>, io::Error> {
-    let read_dir = fs::read_dir(dir)?;
     let mut subdirs = Vec::<PathBuf>::new();
+    // definitely works but ignores most errors
+    /*for direntry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let ft = direntry.file_type()?;
+        if !ft.is_dir() {
+            continue;
+        }
+        subdirs.push(direntry.path());
+    }*/
+    // Bug? entry_res might be Err (e.g. permission denied on special/broken files
+    // or other weird corner cases),
+    let read_dir = fs::read_dir(dir)?;
     for entry_res in read_dir {
         let direntry = entry_res?;
         let ft = direntry.file_type()?;
@@ -207,6 +217,7 @@ fn process_dir(
             let subdir_paths = match get_subdirs(&dir) {
                 Ok(v) => v,
                 Err(e) if e.kind() == ErrorKind::NotFound => {
+                    error!("Fatal: failed to process {:?}: {:?}", dir, e.to_string());
                     return ControlFlow::Continue(())
                 }
                 Err(e) => {
@@ -300,6 +311,10 @@ fn main() {
             })
         });
     }
+
+    // XXX big BUG: errors can get lost in output
+    // normal output will be printed out after errors as channel is flushed
+    // and workers are dying.
 
     // Close our match sender so match_rx disconnects when all workers exit,
     // so that we know when there is no more work to be done.
