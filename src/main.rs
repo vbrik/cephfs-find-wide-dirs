@@ -23,7 +23,7 @@ use std::{
 };
 use thiserror::Error;
 use xattr;
-
+use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy)]
 struct DebugFlags {
@@ -39,12 +39,6 @@ struct DebugFlags {
 enum WorkItem {
     Dir(PathBuf), // process this dir
     Shutdown,     // everybody shut down
-}
-
-#[derive(Debug, Clone, Copy)]
-enum MainLoopCtl {
-    Continue,
-    Break,
 }
 
 /// Errors for "xattr read + parse" operations.
@@ -121,49 +115,12 @@ fn get_file_counts_numeric(dir: &Path) -> Result<(u32, u32), XattrError> {
     Ok((num_files, num_rfiles))
 }
 
-fn get_file_counts_numeric_ctl(dir: &Path) -> Result<(u32, u32), MainLoopCtl> {
-    let counts = match get_file_counts_numeric(&dir) {
-        Ok(v) => v,
-        Err(e) if e.is_path_not_found() => {
-            // directory disappeared -- this is expected
-            return Err(MainLoopCtl::Continue);
-        }
-        Err(e) => {
-            error!("Fatal: failed to process {:?}: {:?}", dir, e);
-            return Err(MainLoopCtl::Break);
-        }
-    };
-    Ok(counts)
-}
-
-fn get_subdirs_ctl(dir: &Path) -> Result<Vec<PathBuf>, MainLoopCtl> {
-    let read_dir = match fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            // directory disappearances are normal
-            return Err(MainLoopCtl::Continue);
-        }
-        Err(e) => {
-            error!("Fatal: failed to process {:?}: {:?}", dir, e);
-            return Err(MainLoopCtl::Break);
-        }
-    };
+fn get_subdirs(dir: &Path) -> Result<Vec<PathBuf>, io::Error> {
+    let read_dir = fs::read_dir(dir)?;
     let mut subdirs = Vec::<PathBuf>::new();
     for entry_res in read_dir {
-        let direntry = match entry_res {
-            Ok(e) => e,
-            Err(e) => {
-                error!("Skipping entry in {:?}: {:?}", dir, e);
-                return Err(MainLoopCtl::Break);
-            }
-        };
-        let ft = match direntry.file_type() {
-            Ok(ft) => ft,
-            Err(e) => {
-                error!("File type error {:?} {:?} {:?}", dir, direntry.path(), e);
-                return Err(MainLoopCtl::Break);
-            }
-        };
+        let direntry = entry_res?;
+        let ft = direntry.file_type()?;
         if !ft.is_dir() {
             continue;
         }
@@ -201,8 +158,8 @@ fn worker_loop(
             dbg,
         );
         match ctl {
-            MainLoopCtl::Continue => continue,
-            MainLoopCtl::Break => break,
+            ControlFlow::Continue(_)  => continue,
+            ControlFlow::Break(_) => break,
         }
     }
     let _ = dir_tx.send(WorkItem::Shutdown);
@@ -216,15 +173,22 @@ fn process_dir(
     pending_dir_count: &Arc<AtomicU64>,
     min_file_count: u32,
     dbg: DebugFlags,
-) -> MainLoopCtl {
+) -> ControlFlow<()> {
     // This function must not return before updating pending_dir_count,
     // even if problems are encountered. To accomplish this, actual directory
     // processing is done inside the closure below.
-    let loop_ctl_signal = (|| -> MainLoopCtl {
+    let loop_ctl_signal = (|| -> ControlFlow<()> {
         let (num_files, num_rfiles) = if !dbg.no_xattrs {
-            match get_file_counts_numeric_ctl(&dir) {
+            match get_file_counts_numeric(&dir) {
                 Ok(v) => v,
-                Err(loop_signal) => return loop_signal,
+                Err(e) if e.is_path_not_found() => {
+                    // directory disappeared -- this is expected
+                    return ControlFlow::Continue(())
+                }
+                Err(e) => {
+                    error!("Fatal: failed to process {:?}: {:?}", dir, e);
+                    return ControlFlow::Break(());
+                }
             }
         } else {
             (0, 0)
@@ -234,15 +198,21 @@ fn process_dir(
         if num_files >= min_file_count || dbg.no_xattrs {
             if match_tx.send((dir.clone(), num_files)).is_err() {
                 error!("Fatal: match_tx disconnected");
-                return MainLoopCtl::Break;
+                return ControlFlow::Break(());
             }
         }
 
         // Do we need to traverse subdirs?
         if num_rfiles.saturating_sub(num_files) >= min_file_count || dbg.no_xattrs {
-            let subdir_paths = match get_subdirs_ctl(&dir) {
+            let subdir_paths = match get_subdirs(&dir) {
                 Ok(v) => v,
-                Err(loop_signal) => return loop_signal,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    return ControlFlow::Continue(())
+                }
+                Err(e) => {
+                    error!("Fatal: failed to process {:?}: {:?}", dir, e.to_string());
+                    return ControlFlow::Break(());
+                }
             };
             for path in subdir_paths {
                 // Semantically, pending_dir_count counts queued + in-flight directories.
@@ -251,16 +221,18 @@ fn process_dir(
                 pending_dir_count.fetch_add(1, Ordering::Relaxed);
                 if dir_tx.send(WorkItem::Dir(path)).is_err() {
                     error!("Fatal: dir_tx disconnected");
-                    return MainLoopCtl::Break;
+                    return ControlFlow::Break(());
                 }
             }
         }
-        MainLoopCtl::Continue
+        ControlFlow::Continue(())
     })();
 
+    // We are done processing the directory (it's no longer "in-flight").
+    // Success or failure, doesn't matter, must decrement pending count
     if pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
-        return MainLoopCtl::Break;
+        return ControlFlow::Break(());
     }
     loop_ctl_signal
 }
