@@ -31,16 +31,6 @@ struct DebugFlags {
     no_xattrs: bool,
 }
 
-/// Work items in the directory traversal pipeline.
-/// `Shutdown` is a *pass-along* sentinel: any worker that receives it re-sends it
-/// and then exits. This lets us shut down all workers with a single token, without
-/// requiring workers to know the total worker count.
-#[derive(Debug)]
-enum WorkItem {
-    Dir(PathBuf), // process this dir
-    Shutdown,     // everybody shut down
-}
-
 /// Errors for "xattr read + parse" operations.
 #[derive(Debug, Error)]
 enum XattrError {
@@ -78,12 +68,35 @@ impl XattrError {
     }
 }
 
+#[derive(Debug)]
 struct DirInfo {
     path: PathBuf,
     num_files: u32,
 }
 
-#[derive(Clone)]
+/// Work items in the directory traversal pipeline.
+/// `Shutdown` is a *pass-along* sentinel: any worker that receives it re-sends it
+/// and then exits. This lets us shut down all workers with a single token, without
+/// requiring workers to know the total worker count.
+#[derive(Debug)]
+enum WorkItem {
+    /// Process the directory at PathBuf
+    Dir(PathBuf),
+    /// Shut down and tell others to shut down
+    Shutdown,
+}
+
+/// `dir_{tx,rx}`: channel for directories that need to be processed (workers send and
+/// receive, main() uses dir_tx once to seed with the path of the search tree root).
+/// See `WorkItem` for semantics of worker-initiated shutdown.
+///
+/// `match_tx`: workers send to main() directories that match and processing errors.
+/// closure of this channel means main() wants all workers to terminate immediately
+///
+/// `pending_dir_count`: counts queued + in-flight directories. More precisely, the
+/// invariant is: pending_dir_count >= queued + in-flight, so increment before enqueue.
+/// This is used to detect when there is no more work to be done
+#[derive(Debug, Clone)]
 struct SharedState {
     dir_tx: Sender<WorkItem>,
     dir_rx: Receiver<WorkItem>,
@@ -171,14 +184,12 @@ fn worker_loop(comms: SharedState, min_file_count: u32, dbg: DebugFlags) {
             ControlFlow::Break(msg_opt) => {
                 match msg_opt {
                     Some(msg) => {
-                        if comms.match_tx.send(Err(msg)).is_err() {
-                            dbg!("Fatal: match_tx disconnected");
-                        }
-                    },
-                    None => {},
+                        let _ = comms.match_tx.send(Err(msg));
+                    }
+                    None => {}
                 }
-                break
-            },
+                break;
+            }
         }
     }
     let _ = comms.dir_tx.send(WorkItem::Shutdown);
@@ -203,9 +214,10 @@ fn process_dir(
                     return ControlFlow::Continue(());
                 }
                 Err(e) => {
-                    return ControlFlow::Break(
-                        Some(format!("Fatal: failed to process {:?}: {:?}", dir, e))
-                    );
+                    return ControlFlow::Break(Some(format!(
+                        "Fatal: failed to process {:?}: {:?}",
+                        dir, e
+                    )));
                 }
             }
         } else {
@@ -214,9 +226,12 @@ fn process_dir(
 
         // Are we a match?
         if num_files >= min_file_count || dbg.no_xattrs {
-            let dir_info = DirInfo {path: dir.clone(), num_files };
+            let dir_info = DirInfo {
+                path: dir.clone(),
+                num_files,
+            };
             if comms.match_tx.send(Ok(dir_info)).is_err() {
-                error!("Fatal: match_tx disconnected");
+                error!("Fatal: match_tx disconnected. Emergency shutdown?");
                 return ControlFlow::Break(None);
             }
         }
@@ -229,7 +244,11 @@ fn process_dir(
                     return ControlFlow::Continue(());
                 }
                 Err(e) => {
-                    return ControlFlow::Break(Some(format!("Fatal: failed to process {:?}: {:?}", dir, e.to_string())));
+                    return ControlFlow::Break(Some(format!(
+                        "Fatal: failed to process {:?}: {:?}",
+                        dir,
+                        e.to_string()
+                    )));
                 }
             };
             for path in subdir_paths {
@@ -292,20 +311,14 @@ fn main() {
 
     let n_workers: usize = args.num_threads.try_into().expect("conversion");
 
-    // Channel for directories that need to be processed (workers send and receive)
+    // Construct a SharedState. See SharedState outer doc for field semantics.
     let (dir_tx, dir_rx) = unbounded::<WorkItem>();
-    // Channel for directories that match the criteria (workers send to main)
     let (match_tx, match_rx) = unbounded::<Result<DirInfo, String>>();
-
-    // A counter to detect when there is no more work to be done.
-    // dirs_pending >= dirs pending processing + dirs being processed
     let pending_dir_count = Arc::new(AtomicU64::new(0));
-
-    pending_dir_count.fetch_add(1, Ordering::Relaxed);
+    pending_dir_count.fetch_add(1, Ordering::AcqRel);
     dir_tx
         .send(WorkItem::Dir(root))
         .expect("Must be able to enqueue root");
-
     let comms = SharedState {
         dir_tx,
         dir_rx,
@@ -321,23 +334,19 @@ fn main() {
         });
     }
 
-    // XXX big BUG: errors can get lost in output
-    // normal output will be printed out after errors as channel is flushed
-    // and workers are dying.
-
     // Close our match sender so match_rx disconnects when all workers exit,
     // so that we know when there is no more work to be done.
-    drop(comms.match_tx);
+    drop(comms);
     while let Ok(match_res) = match_rx.recv() {
         match match_res {
             Ok(info) => println!("{}/ {}", info.path.display(), info.num_files),
             Err(msg) => {
                 eprintln!("{:?}", msg);
+                // Force emergency shutdown
                 drop(match_rx);
                 break;
-            },
+            }
         }
-
     }
 
     for h in workers {
