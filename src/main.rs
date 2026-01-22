@@ -10,6 +10,7 @@
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use log::error;
+use std::ops::ControlFlow;
 use std::{
     fs, io,
     io::ErrorKind,
@@ -23,7 +24,6 @@ use std::{
 };
 use thiserror::Error;
 use xattr;
-use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy)]
 struct DebugFlags {
@@ -78,6 +78,14 @@ impl XattrError {
     }
 }
 
+#[derive(Clone)]
+struct SharedState {
+    dir_tx: Sender<WorkItem>,
+    dir_rx: Receiver<WorkItem>,
+    match_tx: Sender<(PathBuf, u32)>,
+    pending_dir_count: Arc<AtomicU64>,
+}
+
 /// Read an xattr and parse it as a numeric type.
 fn get_xattr_numeric<T>(path: &Path, attr: &str) -> Result<T, XattrError>
 where
@@ -125,7 +133,7 @@ fn get_subdirs(dir: &Path) -> Result<Vec<PathBuf>, io::Error> {
         }
         subdirs.push(direntry.path());
     }*/
-    // Bug? entry_res might be Err (e.g. permission denied on special/broken files
+    // Bug? entry_res might be an Err (e.g. permission denied on special/broken files
     // or other weird corner cases),
     let read_dir = fs::read_dir(dir)?;
     for entry_res in read_dir {
@@ -140,16 +148,9 @@ fn get_subdirs(dir: &Path) -> Result<Vec<PathBuf>, io::Error> {
 }
 
 /// Main worker loop
-fn worker_loop(
-    dir_rx: Receiver<WorkItem>,        // incoming work queue
-    dir_tx: Sender<WorkItem>,          // outgoing work queue
-    match_tx: Sender<(PathBuf, u32)>,  // outgoing match queue
-    pending_dir_count: Arc<AtomicU64>, // upper limit on pending and in-flight dirs (when to stop)
-    min_file_count: u32,
-    dbg: DebugFlags,
-) {
+fn worker_loop(comms: SharedState, min_file_count: u32, dbg: DebugFlags) {
     loop {
-        let Ok(work) = dir_rx.recv() else {
+        let Ok(work) = comms.dir_rx.recv() else {
             error!("Fatal: dir_rx disconnected");
             break;
         };
@@ -159,28 +160,19 @@ fn worker_loop(
                 break;
             }
         };
-        let ctl = process_dir(
-            &dir,
-            &dir_tx,
-            &match_tx,
-            &pending_dir_count,
-            min_file_count,
-            dbg,
-        );
+        let ctl = process_dir(&dir, &comms, min_file_count, dbg);
         match ctl {
-            ControlFlow::Continue(_)  => continue,
+            ControlFlow::Continue(_) => continue,
             ControlFlow::Break(_) => break,
         }
     }
-    let _ = dir_tx.send(WorkItem::Shutdown);
+    let _ = comms.dir_tx.send(WorkItem::Shutdown);
 }
 
 /// Process a single directory
 fn process_dir(
     dir: &PathBuf,
-    dir_tx: &Sender<WorkItem>,
-    match_tx: &Sender<(PathBuf, u32)>,
-    pending_dir_count: &Arc<AtomicU64>,
+    comms: &SharedState,
     min_file_count: u32,
     dbg: DebugFlags,
 ) -> ControlFlow<()> {
@@ -193,7 +185,7 @@ fn process_dir(
                 Ok(v) => v,
                 Err(e) if e.is_path_not_found() => {
                     // directory disappeared -- this is expected
-                    return ControlFlow::Continue(())
+                    return ControlFlow::Continue(());
                 }
                 Err(e) => {
                     error!("Fatal: failed to process {:?}: {:?}", dir, e);
@@ -206,7 +198,7 @@ fn process_dir(
 
         // Are we a match?
         if num_files >= min_file_count || dbg.no_xattrs {
-            if match_tx.send((dir.clone(), num_files)).is_err() {
+            if comms.match_tx.send((dir.clone(), num_files)).is_err() {
                 error!("Fatal: match_tx disconnected");
                 return ControlFlow::Break(());
             }
@@ -218,7 +210,7 @@ fn process_dir(
                 Ok(v) => v,
                 Err(e) if e.kind() == ErrorKind::NotFound => {
                     error!("Fatal: failed to process {:?}: {:?}", dir, e.to_string());
-                    return ControlFlow::Continue(())
+                    return ControlFlow::Continue(());
                 }
                 Err(e) => {
                     error!("Fatal: failed to process {:?}: {:?}", dir, e.to_string());
@@ -229,8 +221,8 @@ fn process_dir(
                 // Semantically, pending_dir_count counts queued + in-flight directories.
                 // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
                 // so increment before enqueue.
-                pending_dir_count.fetch_add(1, Ordering::Relaxed);
-                if dir_tx.send(WorkItem::Dir(path)).is_err() {
+                comms.pending_dir_count.fetch_add(1, Ordering::Relaxed);
+                if comms.dir_tx.send(WorkItem::Dir(path)).is_err() {
                     error!("Fatal: dir_tx disconnected");
                     return ControlFlow::Break(());
                 }
@@ -241,7 +233,7 @@ fn process_dir(
 
     // We are done processing the directory (it's no longer "in-flight").
     // Success or failure, doesn't matter, must decrement pending count
-    if pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+    if comms.pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
         return ControlFlow::Break(());
     }
@@ -292,23 +284,25 @@ fn main() {
 
     // A counter to detect when there is no more work to be done.
     // dirs_pending >= dirs pending processing + dirs being processed
-    let dirs_pending = Arc::new(AtomicU64::new(0));
+    let pending_dir_count = Arc::new(AtomicU64::new(0));
 
-    dirs_pending.fetch_add(1, Ordering::Relaxed);
+    pending_dir_count.fetch_add(1, Ordering::Relaxed);
     dir_tx
         .send(WorkItem::Dir(root))
         .expect("Must be able to enqueue root");
 
+    let comms = SharedState {
+        dir_tx,
+        dir_rx,
+        match_tx,
+        pending_dir_count,
+    };
+
     let mut workers = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
         workers.push({
-            let dir_rx = dir_rx.clone();
-            let dir_tx = dir_tx.clone();
-            let match_tx = match_tx.clone();
-            let pending = Arc::clone(&dirs_pending);
-            thread::spawn(move || {
-                worker_loop(dir_rx, dir_tx, match_tx, pending, args.min_files, dbg)
-            })
+            let comms = comms.clone();
+            thread::spawn(move || worker_loop(comms, args.min_files, dbg))
         });
     }
 
@@ -318,7 +312,7 @@ fn main() {
 
     // Close our match sender so match_rx disconnects when all workers exit,
     // so that we know when there is no more work to be done.
-    drop(match_tx);
+    drop(comms.match_tx);
     while let Ok((path, num_files)) = match_rx.recv() {
         println!("{}/ {}", path.display(), num_files);
     }
