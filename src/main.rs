@@ -78,11 +78,16 @@ impl XattrError {
     }
 }
 
+struct DirInfo {
+    path: PathBuf,
+    num_files: u32,
+}
+
 #[derive(Clone)]
 struct SharedState {
     dir_tx: Sender<WorkItem>,
     dir_rx: Receiver<WorkItem>,
-    match_tx: Sender<(PathBuf, u32)>,
+    match_tx: Sender<Result<DirInfo, String>>,
     pending_dir_count: Arc<AtomicU64>,
 }
 
@@ -163,7 +168,17 @@ fn worker_loop(comms: SharedState, min_file_count: u32, dbg: DebugFlags) {
         let ctl = process_dir(&dir, &comms, min_file_count, dbg);
         match ctl {
             ControlFlow::Continue(_) => continue,
-            ControlFlow::Break(_) => break,
+            ControlFlow::Break(msg_opt) => {
+                match msg_opt {
+                    Some(msg) => {
+                        if comms.match_tx.send(Err(msg)).is_err() {
+                            dbg!("Fatal: match_tx disconnected");
+                        }
+                    },
+                    None => {},
+                }
+                break
+            },
         }
     }
     let _ = comms.dir_tx.send(WorkItem::Shutdown);
@@ -175,11 +190,11 @@ fn process_dir(
     comms: &SharedState,
     min_file_count: u32,
     dbg: DebugFlags,
-) -> ControlFlow<()> {
+) -> ControlFlow<Option<String>> {
     // This function must not return before updating pending_dir_count,
     // even if problems are encountered. To accomplish this, actual directory
     // processing is done inside the closure below.
-    let loop_ctl_signal = (|| -> ControlFlow<()> {
+    let loop_ctl_signal = (|| -> ControlFlow<Option<String>> {
         let (num_files, num_rfiles) = if !dbg.no_xattrs {
             match get_file_counts_numeric(&dir) {
                 Ok(v) => v,
@@ -188,8 +203,9 @@ fn process_dir(
                     return ControlFlow::Continue(());
                 }
                 Err(e) => {
-                    error!("Fatal: failed to process {:?}: {:?}", dir, e);
-                    return ControlFlow::Break(());
+                    return ControlFlow::Break(
+                        Some(format!("Fatal: failed to process {:?}: {:?}", dir, e))
+                    );
                 }
             }
         } else {
@@ -198,9 +214,10 @@ fn process_dir(
 
         // Are we a match?
         if num_files >= min_file_count || dbg.no_xattrs {
-            if comms.match_tx.send((dir.clone(), num_files)).is_err() {
+            let dir_info = DirInfo {path: dir.clone(), num_files };
+            if comms.match_tx.send(Ok(dir_info)).is_err() {
                 error!("Fatal: match_tx disconnected");
-                return ControlFlow::Break(());
+                return ControlFlow::Break(None);
             }
         }
 
@@ -209,12 +226,10 @@ fn process_dir(
             let subdir_paths = match get_subdirs(&dir) {
                 Ok(v) => v,
                 Err(e) if e.kind() == ErrorKind::NotFound => {
-                    error!("Fatal: failed to process {:?}: {:?}", dir, e.to_string());
                     return ControlFlow::Continue(());
                 }
                 Err(e) => {
-                    error!("Fatal: failed to process {:?}: {:?}", dir, e.to_string());
-                    return ControlFlow::Break(());
+                    return ControlFlow::Break(Some(format!("Fatal: failed to process {:?}: {:?}", dir, e.to_string())));
                 }
             };
             for path in subdir_paths {
@@ -224,7 +239,7 @@ fn process_dir(
                 comms.pending_dir_count.fetch_add(1, Ordering::Relaxed);
                 if comms.dir_tx.send(WorkItem::Dir(path)).is_err() {
                     error!("Fatal: dir_tx disconnected");
-                    return ControlFlow::Break(());
+                    return ControlFlow::Break(None);
                 }
             }
         }
@@ -235,7 +250,7 @@ fn process_dir(
     // Success or failure, doesn't matter, must decrement pending count
     if comms.pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
         // Finishing this directory made pending go 1 -> 0. This means no more work.
-        return ControlFlow::Break(());
+        return ControlFlow::Break(None);
     }
     loop_ctl_signal
 }
@@ -280,7 +295,7 @@ fn main() {
     // Channel for directories that need to be processed (workers send and receive)
     let (dir_tx, dir_rx) = unbounded::<WorkItem>();
     // Channel for directories that match the criteria (workers send to main)
-    let (match_tx, match_rx) = unbounded::<(PathBuf, u32)>();
+    let (match_tx, match_rx) = unbounded::<Result<DirInfo, String>>();
 
     // A counter to detect when there is no more work to be done.
     // dirs_pending >= dirs pending processing + dirs being processed
@@ -313,8 +328,16 @@ fn main() {
     // Close our match sender so match_rx disconnects when all workers exit,
     // so that we know when there is no more work to be done.
     drop(comms.match_tx);
-    while let Ok((path, num_files)) = match_rx.recv() {
-        println!("{}/ {}", path.display(), num_files);
+    while let Ok(match_res) = match_rx.recv() {
+        match match_res {
+            Ok(info) => println!("{}/ {}", info.path.display(), info.num_files),
+            Err(msg) => {
+                eprintln!("{:?}", msg);
+                drop(match_rx);
+                break;
+            },
+        }
+
     }
 
     for h in workers {
