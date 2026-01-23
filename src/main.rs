@@ -179,6 +179,12 @@ fn worker_loop(comms: SharedState, min_file_count: u32, dbg: DebugFlags) {
             }
         };
         let ctl = process_dir(&dir, &comms, min_file_count, dbg);
+        // We are done processing the directory (it's no longer "in-flight").
+        // Success or failure, doesn't matter, must decrement pending count
+        if comms.pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Finishing this directory made pending go 1 -> 0. This means no more work.
+            break;
+        }
         match ctl {
             ControlFlow::Continue(_) => continue,
             ControlFlow::Break(msg_opt) => {
@@ -192,8 +198,11 @@ fn worker_loop(comms: SharedState, min_file_count: u32, dbg: DebugFlags) {
             }
         }
     }
+    // A fatal error has occurred, or we are out of work, or we have
+    // received the Shutdown token, in which case we need to put it back
     let _ = comms.dir_tx.send(WorkItem::Shutdown);
 }
+
 
 /// Process a single directory
 fn process_dir(
@@ -202,76 +211,63 @@ fn process_dir(
     min_file_count: u32,
     dbg: DebugFlags,
 ) -> ControlFlow<Option<String>> {
-    // This function must not return before updating pending_dir_count,
-    // even if problems are encountered. To accomplish this, actual directory
-    // processing is done inside the closure below.
-    let loop_ctl_signal = (|| -> ControlFlow<Option<String>> {
-        let (num_files, num_rfiles) = if !dbg.no_xattrs {
-            match get_file_counts_numeric(&dir) {
-                Ok(v) => v,
-                Err(e) if e.is_path_not_found() => {
-                    // directory disappeared -- this is expected
-                    return ControlFlow::Continue(());
-                }
-                Err(e) => {
-                    return ControlFlow::Break(Some(format!(
-                        "Fatal: failed to process {:?}: {:?}",
-                        dir, e
-                    )));
-                }
+    let (num_files, num_rfiles) = if !dbg.no_xattrs {
+        match get_file_counts_numeric(&dir) {
+            Ok(v) => v,
+            Err(e) if e.is_path_not_found() => {
+                // directory disappeared -- this is expected
+                return ControlFlow::Continue(());
             }
-        } else {
-            (0, 0)
-        };
+            Err(e) => {
+                return ControlFlow::Break(Some(format!(
+                    "Fatal: failed to process {:?}: {:?}",
+                    dir, e
+                )));
+            }
+        }
+    } else {
+        (0, 0)
+    };
 
-        // Are we a match?
-        if num_files >= min_file_count || dbg.no_xattrs {
-            let dir_info = DirInfo {
-                path: dir.clone(),
-                num_files,
-            };
-            if comms.match_tx.send(Ok(dir_info)).is_err() {
-                error!("Fatal: match_tx disconnected. Emergency shutdown?");
+    // Are we a match?
+    if num_files >= min_file_count || dbg.no_xattrs {
+        let dir_info = DirInfo {
+            path: dir.clone(),
+            num_files,
+        };
+        if comms.match_tx.send(Ok(dir_info)).is_err() {
+            error!("Fatal: match_tx disconnected. Emergency shutdown?");
+            return ControlFlow::Break(None);
+        }
+    }
+
+    // Do we need to traverse subdirs?
+    if num_rfiles.saturating_sub(num_files) >= min_file_count || dbg.no_xattrs {
+        let subdir_paths = match get_subdirs(&dir) {
+            Ok(v) => v,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return ControlFlow::Continue(());
+            }
+            Err(e) => {
+                return ControlFlow::Break(Some(format!(
+                    "Fatal: failed to process {:?}: {:?}",
+                    dir,
+                    e.to_string()
+                )));
+            }
+        };
+        for path in subdir_paths {
+            // Semantically, pending_dir_count counts queued + in-flight directories.
+            // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
+            // so increment before enqueue.
+            comms.pending_dir_count.fetch_add(1, Ordering::Relaxed);
+            if comms.dir_tx.send(WorkItem::Dir(path)).is_err() {
+                error!("Fatal: dir_tx disconnected");
                 return ControlFlow::Break(None);
             }
         }
-
-        // Do we need to traverse subdirs?
-        if num_rfiles.saturating_sub(num_files) >= min_file_count || dbg.no_xattrs {
-            let subdir_paths = match get_subdirs(&dir) {
-                Ok(v) => v,
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    return ControlFlow::Continue(());
-                }
-                Err(e) => {
-                    return ControlFlow::Break(Some(format!(
-                        "Fatal: failed to process {:?}: {:?}",
-                        dir,
-                        e.to_string()
-                    )));
-                }
-            };
-            for path in subdir_paths {
-                // Semantically, pending_dir_count counts queued + in-flight directories.
-                // More precisely, the invariant is: pending_dir_count >= queued + in-flight,
-                // so increment before enqueue.
-                comms.pending_dir_count.fetch_add(1, Ordering::Relaxed);
-                if comms.dir_tx.send(WorkItem::Dir(path)).is_err() {
-                    error!("Fatal: dir_tx disconnected");
-                    return ControlFlow::Break(None);
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    })();
-
-    // We are done processing the directory (it's no longer "in-flight").
-    // Success or failure, doesn't matter, must decrement pending count
-    if comms.pending_dir_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-        // Finishing this directory made pending go 1 -> 0. This means no more work.
-        return ControlFlow::Break(None);
     }
-    loop_ctl_signal
+    ControlFlow::Continue(())
 }
 
 #[derive(Parser, Debug)]
