@@ -335,7 +335,7 @@ fn main() {
     drop(comms);
     while let Ok(match_res) = match_rx.recv() {
         match match_res {
-            Ok(info) => println!("{}/ {}", info.path.display(), info.num_files),
+            Ok(info) => println!("{} {}/", info.num_files, info.path.display()),
             Err(msg) => {
                 eprintln!("{:?}", msg);
                 // Force emergency shutdown
